@@ -42,16 +42,16 @@ If the shortcut does not use your login shell environment, use absolute paths an
 7. Set **Command** to one of the commands below.
 8. Set the shortcut to `F9`.
 
+For the default Qwen streaming model:
+
+```bash
+/home/USER/.local/bin/nerd-dictation-toggle --asr-engine=QWEN --qwen-model=streaming
+```
+
 For the Qwen message model:
 
 ```bash
 /home/USER/.local/bin/nerd-dictation-toggle --asr-engine=QWEN --qwen-model=message
-```
-
-For the Qwen streaming model:
-
-```bash
-/home/USER/.local/bin/nerd-dictation-toggle --asr-engine=QWEN --qwen-model=streaming
 ```
 
 For local Vosk recognition:
@@ -72,7 +72,7 @@ PATH_KEY=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/nerd-d
 
 gsettings set "$SCHEMA" custom-keybindings "['$PATH_KEY']"
 gsettings set "$SCHEMA.custom-keybinding:$PATH_KEY" name 'Toggle nerd-dictation'
-gsettings set "$SCHEMA.custom-keybinding:$PATH_KEY" command '/home/USER/.local/bin/nerd-dictation-toggle --asr-engine=QWEN --qwen-model=message'
+gsettings set "$SCHEMA.custom-keybinding:$PATH_KEY" command '/home/USER/.local/bin/nerd-dictation-toggle --asr-engine=QWEN --qwen-model=streaming'
 gsettings set "$SCHEMA.custom-keybinding:$PATH_KEY" binding 'F9'
 ```
 
@@ -100,7 +100,7 @@ The F9 shortcut itself works on both X11 and Wayland. Simulated text input is se
 Add the input tool option to the shortcut command. For example:
 
 ```bash
-/home/USER/.local/bin/nerd-dictation-toggle --asr-engine=QWEN --qwen-model=message --simulate-input-tool=YDOTOOL
+/home/USER/.local/bin/nerd-dictation-toggle --asr-engine=QWEN --qwen-model=streaming --simulate-input-tool=YDOTOOL
 ```
 
 ## Troubleshooting

@@ -155,18 +155,18 @@ Then configure the API key and select a model:
 .. code-block:: sh
 
    export DASHSCOPE_API_KEY='sk-...'
-   ./nerd-dictation begin --asr-engine=QWEN --qwen-model=message
+   ./nerd-dictation begin --asr-engine=QWEN --qwen-model=streaming
    ./nerd-dictation end
 
 The available aliases are:
 
+- ``streaming``: ``qwen-audio-3.1-asr-flash-streaming``, the default general
+  real-time streaming model.
 - ``message``: ``qwen-audio-3.1-asr-flash-message``, optimized for voice
   messages and input methods.
-- ``streaming``: ``qwen-audio-3.1-asr-flash-streaming``, the general
-  real-time streaming model.
 
-Switch models by changing ``--qwen-model=message`` to
-``--qwen-model=streaming``.  Qwen audio is sent to Alibaba Cloud, so this
+Switch models by changing ``--qwen-model=streaming`` to
+``--qwen-model=message``.  Qwen audio is sent to Alibaba Cloud, so this
 backend requires a network connection and is not an offline replacement.
 
 See
@@ -277,8 +277,8 @@ options:
                         https://github.com/alphacep/vosk-api/blob/master/src/vosk_api.h
   --qwen-model MODEL    Qwen ASR model id. Aliases are available for testing:
 
-                        - ``message``: qwen-audio-3.1-asr-flash-message (default).
-                        - ``streaming``: qwen-audio-3.1-asr-flash-streaming.
+                        - ``streaming``: qwen-audio-3.1-asr-flash-streaming (default).
+                        - ``message``: qwen-audio-3.1-asr-flash-message.
   --qwen-base-url URL   Qwen WebSocket endpoint. Use the workspace-specific endpoint when available.
   --qwen-api-key-env ENV_VAR
                         Environment variable that contains the Qwen API key.

@@ -50,7 +50,7 @@ QWEN_MODEL_ALIASES = {
     "streaming": "qwen-audio-3.1-asr-flash-streaming",
 }
 
-QWEN_DEFAULT_MODEL = QWEN_MODEL_ALIASES["message"]
+QWEN_DEFAULT_MODEL = QWEN_MODEL_ALIASES["streaming"]
 QWEN_DEFAULT_BASE_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 QWEN_CONTEXT_ROTATE_TOKENS = 6000
 
@@ -2371,8 +2371,8 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
         help=(
             "Qwen ASR model id. Aliases are available for testing:\n"
             "\n"
-            "- ``message``: qwen-audio-3.1-asr-flash-message (default).\n"
-            "- ``streaming``: qwen-audio-3.1-asr-flash-streaming.\n"
+            "- ``streaming``: qwen-audio-3.1-asr-flash-streaming (default).\n"
+            "- ``message``: qwen-audio-3.1-asr-flash-message.\n"
         ),
         required=False,
     )

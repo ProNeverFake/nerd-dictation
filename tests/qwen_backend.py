@@ -220,6 +220,10 @@ class TestQwenRequest(unittest.TestCase):
 
     def test_model_aliases(self) -> None:
         self.assertEqual(
+            nerd_dictation.QWEN_DEFAULT_MODEL,
+            "qwen-audio-3.1-asr-flash-streaming",
+        )
+        self.assertEqual(
             nerd_dictation.qwen_model_id_from_arg("message"),
             "qwen-audio-3.1-asr-flash-message",
         )

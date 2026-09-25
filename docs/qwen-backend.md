@@ -22,19 +22,19 @@ pip install 'websockets>=13'
 
 ## Quick Start
 
-Use the message model, which is optimized for voice messages and input methods:
+The default model is the general real-time streaming model:
 
 ```bash
 export DASHSCOPE_API_KEY='sk-...'
-./nerd-dictation begin --asr-engine=QWEN --qwen-model=message
+./nerd-dictation begin --asr-engine=QWEN --qwen-model=streaming
 # Speak, then run:
 ./nerd-dictation end
 ```
 
-Test the general real-time streaming model:
+Test the message model, which is optimized for voice messages and input methods:
 
 ```bash
-./nerd-dictation begin --asr-engine=QWEN --qwen-model=streaming
+./nerd-dictation begin --asr-engine=QWEN --qwen-model=message
 # Speak, then run:
 ./nerd-dictation end
 ```
@@ -42,8 +42,8 @@ Test the general real-time streaming model:
 The aliases expand to:
 
 ```text
-message   -> qwen-audio-3.1-asr-flash-message
 streaming -> qwen-audio-3.1-asr-flash-streaming
+message   -> qwen-audio-3.1-asr-flash-message
 ```
 
 A full model id can also be passed to `--qwen-model`.
