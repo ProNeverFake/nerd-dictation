@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 """
-Test the model-independent progressive text output and Qwen event adapter.
+Test the model-independent text output worker and Qwen event adapter.
 """
 
 import importlib.machinery
@@ -10,6 +10,8 @@ import importlib.util
 import os
 import queue
 import sys
+import threading
+import time
 import unittest
 
 from types import ModuleType
@@ -29,27 +31,27 @@ def load_nerd_dictation() -> ModuleType:
 nerd_dictation = load_nerd_dictation()
 
 
-class TestProgressiveTextOutput(unittest.TestCase):
+class TestTextOutputProgressiveBehavior(unittest.TestCase):
     def test_replaces_stale_suffix(self) -> None:
-        output = []
+        sink = nerd_dictation.FakeTextSink()
 
-        def handle_fn(delete_prev_chars: int, text: str) -> None:
-            output.append((delete_prev_chars, text))
-
-        text_output = nerd_dictation.ProgressiveTextOutput(
-            handle_fn=handle_fn,
+        text_output = nerd_dictation.TextOutput(
+            sink=sink,
             process_fn=lambda text: text,
             progressive=True,
             progressive_continuous=False,
         )
 
-        text_output.handle("hello wer", True)
-        text_output.handle("hello world", True)
-        text_output.handle("hello world", False)
-        text_output.handle("next", True)
+        text_output.update("hello wer", False)
+        self.assertTrue(sink.wait_for_events(1))
+        text_output.update("hello world", False)
+        self.assertTrue(sink.wait_for_events(2))
+        text_output.update("hello world", True)
+        text_output.update("next", True)
+        text_output.close(flush=True)
 
         self.assertEqual(
-            output,
+            sink.events,
             [
                 (0, "hello wer"),
                 (2, "orld"),
@@ -58,45 +60,43 @@ class TestProgressiveTextOutput(unittest.TestCase):
         )
 
     def test_deferred_output_ignores_partials(self) -> None:
-        output = []
+        sink = nerd_dictation.FakeTextSink()
 
-        def handle_fn(delete_prev_chars: int, text: str) -> None:
-            output.append((delete_prev_chars, text))
-
-        text_output = nerd_dictation.ProgressiveTextOutput(
-            handle_fn=handle_fn,
+        text_output = nerd_dictation.TextOutput(
+            sink=sink,
             process_fn=lambda text: text.upper(),
             progressive=False,
             progressive_continuous=False,
         )
 
-        text_output.handle("hello", True)
-        text_output.handle("hello world", False)
-        text_output.emit_deferred()
+        text_output.update("hello", False)
+        text_output.update("hello world", True)
+        text_output.close(flush=True)
 
-        self.assertEqual(output, [(0, "HELLO WORLD")])
+        self.assertEqual(sink.events, [(0, "HELLO WORLD")])
 
     def test_stable_partial_prefix_defers_unstable_tail(self) -> None:
-        output = []
+        sink = nerd_dictation.FakeTextSink()
 
-        def handle_fn(delete_prev_chars: int, text: str) -> None:
-            output.append((delete_prev_chars, text))
-
-        text_output = nerd_dictation.ProgressiveTextOutput(
-            handle_fn=handle_fn,
+        text_output = nerd_dictation.TextOutput(
+            sink=sink,
             process_fn=lambda text: text,
             progressive=True,
             progressive_continuous=False,
             stable_partial_prefix=True,
         )
 
-        text_output.handle("hel", True)
-        text_output.handle("hell", True)
-        text_output.handle("hello", True)
-        text_output.handle("hello world", False)
+        text_output.update("hel", False)
+        self.assertTrue(sink.wait_for_events(1))
+        text_output.update("hell", False)
+        self.assertTrue(sink.wait_for_events(2))
+        text_output.update("hello", False)
+        self.assertTrue(sink.wait_for_events(3))
+        text_output.update("hello world", True)
+        text_output.close(flush=True)
 
         self.assertEqual(
-            output,
+            sink.events,
             [
                 (0, "h"),
                 (0, "el"),
@@ -104,6 +104,160 @@ class TestProgressiveTextOutput(unittest.TestCase):
                 (0, "o world"),
             ],
         )
+
+
+class BlockingTextSink(nerd_dictation.FakeTextSink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.write_started = threading.Event()
+        self.write_release = threading.Event()
+
+    def type_text(self, delete_prev_chars: int, text: str) -> None:
+        self.write_started.set()
+        if not self.write_release.wait(timeout=2.0):
+            raise TimeoutError("test sink was not released")
+        super().type_text(delete_prev_chars, text)
+
+
+class TestTextOutput(unittest.TestCase):
+    def test_deferred_partial_does_not_mark_output_as_handled(self) -> None:
+        sink = nerd_dictation.FakeTextSink()
+        text_output = nerd_dictation.TextOutput(
+            sink=sink,
+            process_fn=lambda text: text,
+            progressive=False,
+            progressive_continuous=False,
+        )
+        text_output.update("partial", False)
+        self.assertFalse(text_output.handled_any)
+        text_output.close(flush=True)
+        self.assertEqual(sink.events, [])
+
+    def test_delayed_fake_sink_does_not_block_update(self) -> None:
+        sink = nerd_dictation.FakeTextSink(delay_seconds=0.3)
+        text_output = nerd_dictation.TextOutput(
+            sink=sink,
+            process_fn=lambda text: text,
+            progressive=True,
+            progressive_continuous=True,
+        )
+        try:
+            started = time.monotonic()
+            text_output.update("hello", True)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 0.1)
+        finally:
+            text_output.close(flush=True)
+
+        self.assertEqual(sink.events, [(0, "hello")])
+
+    def test_partials_coalesce_latest_wins(self) -> None:
+        sink = BlockingTextSink()
+        text_output = nerd_dictation.TextOutput(
+            sink=sink,
+            process_fn=lambda text: text,
+            progressive=True,
+            progressive_continuous=True,
+        )
+        try:
+            text_output.update("in-flight", True)
+            self.assertTrue(sink.write_started.wait(timeout=1.0))
+            for i in range(100):
+                text_output.update("partial-{:d}".format(i), False)
+        finally:
+            sink.write_release.set()
+            text_output.close(flush=True)
+
+        self.assertEqual(sink.events, [(0, "in-flight"), (0, "partial-99")])
+
+    def test_finals_stay_ordered_and_complete(self) -> None:
+        sink = BlockingTextSink()
+        text_output = nerd_dictation.TextOutput(
+            sink=sink,
+            process_fn=lambda text: text,
+            progressive=True,
+            progressive_continuous=True,
+        )
+        try:
+            text_output.update("first", True)
+            self.assertTrue(sink.write_started.wait(timeout=1.0))
+            text_output.update("second", True)
+            text_output.update("third", True)
+        finally:
+            sink.write_release.set()
+            text_output.close(flush=True)
+
+        self.assertEqual(sink.events, [(0, "first"), (0, "second"), (0, "third")])
+
+    def test_close_flush_waits_for_pending_output(self) -> None:
+        sink = BlockingTextSink()
+        text_output = nerd_dictation.TextOutput(
+            sink=sink,
+            process_fn=lambda text: text,
+            progressive=True,
+            progressive_continuous=True,
+        )
+        text_output.update("hello", True)
+        self.assertTrue(sink.write_started.wait(timeout=1.0))
+
+        close_finished = threading.Event()
+
+        def close_output() -> None:
+            text_output.close(flush=True)
+            close_finished.set()
+
+        close_thread = threading.Thread(target=close_output)
+        close_thread.start()
+        self.assertFalse(close_finished.wait(timeout=0.05))
+        sink.write_release.set()
+        self.assertTrue(close_finished.wait(timeout=1.0))
+        close_thread.join(timeout=1.0)
+
+        self.assertEqual(sink.events, [(0, "hello")])
+
+    def test_cancel_drops_pending_output(self) -> None:
+        sink = BlockingTextSink()
+        text_output = nerd_dictation.TextOutput(
+            sink=sink,
+            process_fn=lambda text: text,
+            progressive=True,
+            progressive_continuous=True,
+        )
+        text_output.update("in-flight", True)
+        self.assertTrue(sink.write_started.wait(timeout=1.0))
+        text_output.update("dropped-1", True)
+        text_output.update("dropped-2", True)
+
+        errors = []
+
+        def close_output() -> None:
+            try:
+                text_output.close(flush=False)
+            except BaseException as ex:
+                errors.append(ex)
+
+        close_thread = threading.Thread(target=close_output)
+        close_thread.start()
+        time.sleep(0.02)
+        sink.write_release.set()
+        close_thread.join(timeout=1.0)
+
+        self.assertFalse(close_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(sink.events, [(0, "in-flight")])
+
+    def test_sink_errors_propagate_from_close(self) -> None:
+        sink = nerd_dictation.FakeTextSink(error=RuntimeError("sink failed"))
+        text_output = nerd_dictation.TextOutput(
+            sink=sink,
+            process_fn=lambda text: text,
+            progressive=False,
+            progressive_continuous=False,
+        )
+        text_output.update("hello", True)
+
+        with self.assertRaisesRegex(RuntimeError, "sink failed"):
+            text_output.close(flush=True)
 
 
 class TestQwenTranscriptState(unittest.TestCase):

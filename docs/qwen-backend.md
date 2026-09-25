@@ -76,6 +76,8 @@ wss://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/inference
 
 Both Qwen models return sentence updates with `sentence_id` and `sentence_end`. The backend converts those events into the same `(text, is_final)` interface used by Vosk.
 
+Text rendering runs in a dedicated output worker. `TextOutput.update()` only records pending state and never performs keyboard I/O, so a slow input command cannot block audio capture or WebSocket event handling. Consecutive partials are coalesced latest-wins, while finalized sentences remain ordered and are flushed during bounded shutdown.
+
 The existing progressive output path calculates the longest common prefix between the previous displayed text and the new text. It sends backspaces for the changed suffix and types the corrected suffix. This is how nerd-dictation can replace an earlier partial recognition result while the user is still speaking.
 
 The Qwen adapter keeps the same behavior while handling these differences:

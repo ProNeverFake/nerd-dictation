@@ -10,6 +10,7 @@ While it could use any system currently it uses the VOSK-API.
 
 # All built in modules.
 import argparse
+from collections import deque
 import json
 import os
 import signal
@@ -25,11 +26,13 @@ import uuid
 # Types.
 from typing import (
     Any,
+    Deque,
     Dict,
     IO,
     List,
     Optional,
     Callable,
+    Protocol,
     Set,
     Tuple,
 )
@@ -880,21 +883,160 @@ def process_text(
 
 
 # -----------------------------------------------------------------------------
-# Progressive Text Output
+# Text Output
 #
 
+TEXT_OUTPUT_CLOSE_TIMEOUT_SECONDS = 5.0
 
-class ProgressiveTextOutput:
+
+class TextSink(Protocol):
+    def setup(self) -> None:
+        ...
+
+    def type_text(self, delete_prev_chars: int, text: str) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
+class XdotoolTextSink:
+    def setup(self) -> None:
+        pass
+
+    def type_text(self, delete_prev_chars: int, text: str) -> None:
+        simulate_typing_with_xdotool(delete_prev_chars, text)
+
+    def close(self) -> None:
+        pass
+
+
+class YdotoolTextSink:
+    def setup(self) -> None:
+        pass
+
+    def type_text(self, delete_prev_chars: int, text: str) -> None:
+        simulate_typing_with_ydotool(delete_prev_chars, text)
+
+    def close(self) -> None:
+        pass
+
+
+class DotoolTextSink:
+    def __init__(self, cmd: str = "dotool") -> None:
+        self.cmd = cmd
+        self.proc: "Optional[subprocess.Popen[str]]" = None
+
+    def setup(self) -> None:
+        assert self.proc is None
+        proc = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, universal_newlines=True)
+        assert proc.stdin is not None
+        proc.stdin.write("keydelay 4\nkeyhold 0\ntypedelay 12\ntypehold 0\n")
+        proc.stdin.flush()
+        self.proc = proc
+
+    def type_text(self, delete_prev_chars: int, text: str) -> None:
+        assert self.proc is not None
+        stdin = self.proc.stdin
+        assert stdin is not None
+        if delete_prev_chars:
+            stdin.write("key" + (" backspace" * delete_prev_chars) + "\n")
+            stdin.flush()
+
+        stdin.write("type " + text + "\n")
+        stdin.flush()
+
+    def close(self) -> None:
+        proc = self.proc
+        self.proc = None
+        if proc is None:
+            return
+
+        os.kill(proc.pid, signal.SIGINT)
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+class DotoolcTextSink(DotoolTextSink):
+    def __init__(self) -> None:
+        super().__init__(cmd="dotoolc")
+
+
+class WtypeTextSink:
+    def setup(self) -> None:
+        pass
+
+    def type_text(self, delete_prev_chars: int, text: str) -> None:
+        simulate_typing_with_wtype(delete_prev_chars, text)
+
+    def close(self) -> None:
+        pass
+
+
+class StdoutTextSink:
+    def setup(self) -> None:
+        pass
+
+    def type_text(self, delete_prev_chars: int, text: str) -> None:
+        simulate_typing_with_stdout(delete_prev_chars, text)
+
+    def close(self) -> None:
+        pass
+
+
+class FakeTextSink:
+    """
+    In-memory sink used by tests and useful for checking ordering.
+    """
+
+    def __init__(self, delay_seconds: float = 0.0, error: Optional[BaseException] = None) -> None:
+        self.delay_seconds = delay_seconds
+        self.error = error
+        self.events: List[Tuple[int, str]] = []
+        self.setup_count = 0
+        self.close_count = 0
+        self._condition = threading.Condition()
+
+    def setup(self) -> None:
+        self.setup_count += 1
+
+    def type_text(self, delete_prev_chars: int, text: str) -> None:
+        if self.delay_seconds:
+            time.sleep(self.delay_seconds)
+        if self.error is not None:
+            raise self.error
+        with self._condition:
+            self.events.append((delete_prev_chars, text))
+            self._condition.notify_all()
+
+    def wait_for_events(self, count: int, timeout: float = 1.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while len(self.events) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class _ProgressiveTextOutput:
     def __init__(
         self,
         *,
-        handle_fn: Callable[[int, str], None],
+        sink: TextSink,
         process_fn: Callable[[str], str],
         progressive: bool,
         progressive_continuous: bool,
         stable_partial_prefix: bool = False,
     ) -> None:
-        self.handle_fn = handle_fn
+        self.sink = sink
         self.process_fn = process_fn
         self.progressive = progressive
         self.progressive_continuous = progressive_continuous
@@ -921,7 +1063,7 @@ class ProgressiveTextOutput:
                 break
 
         # Emit text, deleting any previous incorrectly transcribed output.
-        self.handle_fn(len(self.text_prev) - match, text_curr[match:])
+        self.sink.type_text(len(self.text_prev) - match, text_curr[match:])
         self.text_prev = text_curr
 
     def _stable_partial_text(self, text_curr: str) -> str:
@@ -971,8 +1113,168 @@ class ProgressiveTextOutput:
 
     def emit_deferred(self) -> None:
         if not self.progressive:
-            # We never arrive here needing deletions.
-            self.handle_fn(0, self.process_fn(" ".join(self.text_list)))
+            # Deferred mode has never displayed a partial result, so no deletions are needed.
+            self.sink.type_text(0, self.process_fn(" ".join(self.text_list)))
+
+
+class TextOutput:
+    def __init__(
+        self,
+        *,
+        sink: TextSink,
+        process_fn: Callable[[str], str],
+        progressive: bool,
+        progressive_continuous: bool,
+        stable_partial_prefix: bool = False,
+        close_timeout: float = TEXT_OUTPUT_CLOSE_TIMEOUT_SECONDS,
+    ) -> None:
+        self._sink = sink
+        self._renderer = _ProgressiveTextOutput(
+            sink=sink,
+            process_fn=process_fn,
+            progressive=progressive,
+            progressive_continuous=progressive_continuous,
+            stable_partial_prefix=stable_partial_prefix,
+        )
+        self._close_timeout = close_timeout
+        self._progressive = progressive
+        self._condition = threading.Condition()
+        self._pending: Deque[Tuple[Optional[str], bool, bool]] = deque()
+        self._handled_any = False
+        self._closing = False
+        self._flush_on_close = False
+        self._close_started = False
+        self._closed = False
+        self._sink_started = False
+        self._worker_error: Optional[BaseException] = None
+        self._worker = threading.Thread(
+            target=self._run,
+            name="nerd-dictation-text-output",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @property
+    def handled_any(self) -> bool:
+        with self._condition:
+            return self._handled_any
+
+    def update(self, text: str, final: bool) -> None:
+        with self._condition:
+            if self._close_started or self._closed:
+                raise RuntimeError("Text output is closed")
+
+            # Consecutive partials only need the latest value. Finals are never coalesced.
+            if not final and self._pending:
+                pending_text, pending_final, pending_reset = self._pending[-1]
+                if pending_text is not None and not pending_final and not pending_reset:
+                    self._pending[-1] = (text, False, False)
+                else:
+                    self._pending.append((text, False, False))
+            else:
+                self._pending.append((text, final, False))
+
+            if self._progressive or final:
+                self._handled_any = True
+            self._condition.notify()
+
+    def reset(self) -> None:
+        with self._condition:
+            if self._close_started or self._closed:
+                return
+            self._pending.append((None, False, True))
+            self._condition.notify()
+
+    def close(self, flush: bool = True) -> None:
+        with self._condition:
+            if not self._close_started:
+                self._close_started = True
+                self._closing = True
+                self._flush_on_close = flush
+                if not flush:
+                    self._pending.clear()
+                    self._handled_any = False
+                self._condition.notify_all()
+
+            deadline = time.monotonic() + self._close_timeout
+            while not self._closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    self._flush_on_close = False
+                    self._pending.clear()
+                    self._handled_any = False
+                    self._condition.notify_all()
+                    raise TimeoutError("Timed out shutting down text output")
+                self._condition.wait(remaining)
+
+            worker_error = self._worker_error
+
+        if worker_error is not None:
+            raise worker_error.with_traceback(worker_error.__traceback__)
+
+    def _run(self) -> None:
+        try:
+            self._sink.setup()
+            self._sink_started = True
+
+            while True:
+                with self._condition:
+                    while not self._pending and not self._closing:
+                        self._condition.wait()
+
+                    if self._pending:
+                        text, final, reset = self._pending.popleft()
+                    elif self._closing:
+                        break
+                    else:
+                        continue
+
+                    if self._closing and not self._flush_on_close:
+                        self._pending.clear()
+                        continue
+
+                if self._closing and not self._flush_on_close:
+                    continue
+
+                if reset:
+                    self._renderer.reset()
+                    with self._condition:
+                        self._handled_any = False
+                    self._sink_started = False
+                    self._sink.close()
+                    continue
+
+                if not self._sink_started:
+                    self._sink.setup()
+                    self._sink_started = True
+
+                assert text is not None
+                self._renderer.handle(text, not final)
+
+            if self._flush_on_close:
+                with self._condition:
+                    handled_any = self._handled_any
+                if handled_any:
+                    if not self._sink_started:
+                        self._sink.setup()
+                        self._sink_started = True
+                    self._renderer.emit_deferred()
+        except BaseException as ex:
+            with self._condition:
+                self._worker_error = ex
+        finally:
+            if self._sink_started:
+                try:
+                    self._sink.close()
+                except BaseException as ex:
+                    with self._condition:
+                        if self._worker_error is None:
+                            self._worker_error = ex
+                self._sink_started = False
+
+            with self._condition:
+                self._closed = True
+                self._condition.notify_all()
 
 
 # -----------------------------------------------------------------------------
@@ -1046,11 +1348,9 @@ def text_from_vosk_pipe(
     vosk_model_dir: str,
     exit_fn: Callable[..., int],
     process_fn: Callable[[str], str],
-    handle_fn: Callable[[int, str], None],
+    text_output: TextOutput,
     timeout: float,
     idle_time: float,
-    progressive: bool,
-    progressive_continuous: bool,
     sample_rate: int,
     input_method: str,
     pulse_device_name: str = "",
@@ -1062,6 +1362,7 @@ def text_from_vosk_pipe(
     import json
 
     if not os.path.exists(vosk_model_dir):
+        text_output.close(flush=False)
         sys.stderr.write(
             "Please download the model from "
             "https://alphacephei.com/vosk/models and unpack it to {!r}.\n".format(vosk_model_dir)
@@ -1109,20 +1410,13 @@ def text_from_vosk_pipe(
         timeout_text_prev = ""
         timeout_time_prev = time.time()
 
-    text_output = ProgressiveTextOutput(
-        handle_fn=handle_fn,
-        process_fn=process_fn,
-        progressive=progressive,
-        progressive_continuous=progressive_continuous,
-    )
-
     # Track this to prevent excessive load when the "partial" result doesn't change.
     json_text_partial_prev = ""
 
     # -----------------------------------------------
     # Utilities for accessing results on `rec` (VOSK)
 
-    def rec_handle_fn_wrapper_from_final_result() -> str:
+    def rec_final_result() -> str:
         json_text = rec.FinalResult()
 
         # When `rec.FinalResult()` returns an empty string, typically immediately after a resume,
@@ -1136,10 +1430,10 @@ def text_from_vosk_pipe(
         text = json_data["text"]
         assert isinstance(text, str)
         if text:
-            text_output.handle(text, False)
+            text_output.update(text, True)
         return json_text
 
-    def rec_handle_fn_wrapper_from_partial_result(json_text_partial_prev: str) -> Tuple[str, str]:
+    def rec_partial_result(json_text_partial_prev: str) -> Tuple[str, str]:
         json_text = rec.PartialResult()
         # Without this, there are *many* calls with the same partial text.
         if json_text_partial_prev != json_text:
@@ -1149,12 +1443,8 @@ def text_from_vosk_pipe(
             # In rare cases this can be unset (when resuming from being suspended).
             text = json_data.get("partial", "")
             if text:
-                text_output.handle(text, True)
+                text_output.update(text, False)
         return json_text, json_text_partial_prev
-
-    if not suspend_on_start:
-        # Support setting up input simulation state.
-        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "SETUP")
 
     # Use code to delay exiting, allowing reading the recording buffer to catch-up.
     code = 0
@@ -1168,12 +1458,11 @@ def text_from_vosk_pipe(
 
     def do_suspend_pause() -> None:
         nonlocal has_ps, ps, stdout
-        rec_handle_fn_wrapper_from_final_result()
+        rec_final_result()
 
         # Don't include any of the current analysis when resuming.
         rec.Reset()
 
-        # Clear the buffer:
         text_output.reset()
 
         nonlocal verbose
@@ -1182,9 +1471,6 @@ def text_from_vosk_pipe(
 
         # Close the recording process.
         if has_ps:
-            # Support setting up input simulation state.
-            handle_fn(SIMULATE_INPUT_CODE_COMMAND, "TEARDOWN")
-
             stdout.close()
             os.kill(ps.pid, signal.SIGINT)
             del stdout, ps
@@ -1200,7 +1486,6 @@ def text_from_vosk_pipe(
         if verbose >= 1:
             sys.stderr.write("Recording.\n")
 
-        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "SETUP")
         ps, stdout = recording_proc_start()
         has_ps = True
 
@@ -1288,9 +1573,9 @@ def text_from_vosk_pipe(
             ok = rec.AcceptWaveform(data)
             if ok:
                 json_text_partial_prev = ""
-                json_text = rec_handle_fn_wrapper_from_final_result()
+                json_text = rec_final_result()
             else:
-                json_text, json_text_partial_prev = rec_handle_fn_wrapper_from_partial_result(json_text_partial_prev)
+                json_text, json_text_partial_prev = rec_partial_result(json_text_partial_prev)
 
             # Monitor the partial output.
             # Finish if no changes are made for `timeout` seconds.
@@ -1309,17 +1594,15 @@ def text_from_vosk_pipe(
         del ps, stdout
         has_ps = False
 
-        # Support setting up input simulation state.
-        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "TEARDOWN")
-
     if code == -1:
+        text_output.close(flush=False)
         sys.stderr.write("Text input canceled!\n")
         sys.exit(0)
 
     # This writes many JSON blocks, use the last one.
-    rec_handle_fn_wrapper_from_final_result()
+    rec_final_result()
 
-    text_output.emit_deferred()
+    text_output.close(flush=True)
 
     return text_output.handled_any
 
@@ -1691,11 +1974,9 @@ def text_from_qwen_pipe(
     qwen_final_timeout: float,
     exit_fn: Callable[..., int],
     process_fn: Callable[[str], str],
-    handle_fn: Callable[[int, str], None],
+    text_output: TextOutput,
     timeout: float,
     idle_time: float,
-    progressive: bool,
-    progressive_continuous: bool,
     sample_rate: int,
     input_method: str,
     pulse_device_name: str = "",
@@ -1703,18 +1984,22 @@ def text_from_qwen_pipe(
     verbose: int = 0,
 ) -> bool:
     if not qwen_api_key:
+        text_output.close(flush=False)
         sys.stderr.write("Qwen backend requires an API key in the configured environment variable.\n")
         sys.exit(1)
 
     if qwen_model == QWEN_MODEL_ALIASES["message"] and sample_rate != 16000:
+        text_output.close(flush=False)
         sys.stderr.write("The Qwen message model only supports a 16000 Hz sample rate.\n")
         sys.exit(1)
 
     if qwen_final_timeout <= 0.0:
+        text_output.close(flush=False)
         sys.stderr.write("--qwen-final-timeout must be greater than zero.\n")
         sys.exit(1)
 
     if qwen_max_sentence_silence is not None and not (200 <= qwen_max_sentence_silence <= 6000):
+        text_output.close(flush=False)
         sys.stderr.write("--qwen-max-sentence-silence must be between 200 and 6000 milliseconds.\n")
         sys.exit(1)
 
@@ -1726,13 +2011,6 @@ def text_from_qwen_pipe(
         ps, stdout = recording_proc_start()
         has_ps = True
 
-    text_output = ProgressiveTextOutput(
-        handle_fn=handle_fn,
-        process_fn=process_fn,
-        progressive=progressive,
-        progressive_continuous=progressive_continuous,
-        stable_partial_prefix=True,
-    )
     transcript_state = QwenTranscriptState()
     def create_qwen_client() -> QwenWebSocketClient:
         return QwenWebSocketClient(
@@ -1754,17 +2032,6 @@ def text_from_qwen_pipe(
         sys.stderr.write("Connecting to Qwen ASR model {!r}...\n".format(qwen_model))
     if not suspend_on_start:
         qwen_client.start()
-
-    input_setup = not suspend_on_start
-    if not suspend_on_start:
-        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "SETUP")
-
-    def teardown_input() -> None:
-        nonlocal input_setup
-        if not input_setup:
-            return
-        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "TEARDOWN")
-        input_setup = False
 
     def close_recording(flush_audio: bool) -> None:
         nonlocal has_ps
@@ -1807,7 +2074,6 @@ def text_from_qwen_pipe(
         nonlocal qwen_client
         nonlocal transcript_state
 
-        text_output.emit_deferred()
         text_output.reset()
         transcript_state = QwenTranscriptState()
         qwen_client.cancel()
@@ -1816,8 +2082,6 @@ def text_from_qwen_pipe(
 
         if verbose >= 1:
             sys.stderr.write("Recording suspended.\n")
-
-        teardown_input()
 
     def do_suspend_resume() -> None:
         nonlocal has_ps
@@ -1830,8 +2094,6 @@ def text_from_qwen_pipe(
         if verbose >= 1:
             sys.stderr.write("Recording.\n")
 
-        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "SETUP")
-        input_setup = True
         ps, stdout = recording_proc_start()
         has_ps = True
         transcript_state = QwenTranscriptState()
@@ -1906,7 +2168,7 @@ def text_from_qwen_pipe(
         )
         qwen_total_tokens = max(qwen_total_tokens, event_total_tokens)
         for _sentence_id, update_text, update_is_final in updates:
-            text_output.handle(update_text, not update_is_final)
+            text_output.update(update_text, update_is_final)
             timeout_time_prev = time.time()
         if qwen_error:
             code = 2
@@ -1949,7 +2211,7 @@ def text_from_qwen_pipe(
         close_recording(flush_audio=False)
         qwen_client.cancel()
         qwen_client.join()
-        teardown_input()
+        text_output.close(flush=False)
         sys.stderr.write("Text input canceled!\n")
         sys.exit(0)
 
@@ -1957,9 +2219,10 @@ def text_from_qwen_pipe(
         close_recording(flush_audio=False)
         qwen_client.cancel()
         qwen_client.join()
-        teardown_input()
+        found_any = text_output.handled_any
+        text_output.close(flush=False)
         sys.stderr.write("Qwen ASR error: {!s}\n".format(qwen_error))
-        return text_output.handled_any
+        return found_any
 
     close_recording(flush_audio=True)
     if not qwen_client.finish():
@@ -1972,25 +2235,24 @@ def text_from_qwen_pipe(
             transcript_state,
         )
         for _sentence_id, update_text, update_is_final in updates:
-            text_output.handle(update_text, not update_is_final)
+            text_output.update(update_text, update_is_final)
 
         if not qwen_finished and not qwen_error:
             time.sleep(0.01)
 
     final_update = transcript_state.finish()
     if final_update is not None:
-        text_output.handle(final_update[0], not final_update[1])
+        text_output.update(final_update[0], final_update[1])
 
     qwen_client.cancel()
     qwen_client.join()
-    teardown_input()
 
     if qwen_error:
         sys.stderr.write("Qwen ASR error: {!s}\n".format(qwen_error))
     elif not qwen_finished:
         sys.stderr.write("Qwen ASR did not finish before the timeout.\n")
 
-    text_output.emit_deferred()
+    text_output.close(flush=True)
     return text_output.handled_any
 
 
@@ -2101,85 +2363,91 @@ def main_begin(
             return 1  # End.
         return 0  # Continue.
 
+    process_fn_lock = threading.RLock()
     process_fn_is_first = True
 
     def process_fn(text: str) -> str:
         nonlocal user_config
         nonlocal process_fn_is_first
 
-        #
-        # Load the user configuration (when found).
-        #
-        # text=="" indicates that user_config should be reloaded (SIGHUP)
-        #
-        if process_fn_is_first or text == "":
-            user_config = user_config_as_module_or_none(config_override=config_override, user_config_prev=user_config)
+        # This function is called by the output worker and the SIGHUP handler.
+        with process_fn_lock:
+            #
+            # Load the user configuration (when found).
+            #
+            # text=="" indicates that user_config should be reloaded (SIGHUP)
+            #
+            if process_fn_is_first or text == "":
+                user_config = user_config_as_module_or_none(
+                    config_override=config_override,
+                    user_config_prev=user_config,
+                )
 
-        if not text:
-            return ""
+            if not text:
+                return ""
 
-        #
-        # Simple text post processing and capitalization.
-        #
-        text = process_text(
-            text,
-            full_sentence=full_sentence,
-            numbers_as_digits=numbers_as_digits,
-            numbers_use_separator=numbers_use_separator,
-            numbers_min_value=numbers_min_value,
-            numbers_no_suffix=numbers_no_suffix,
-        )
+            #
+            # Simple text post processing and capitalization.
+            #
+            text = process_text(
+                text,
+                full_sentence=full_sentence,
+                numbers_as_digits=numbers_as_digits,
+                numbers_use_separator=numbers_use_separator,
+                numbers_min_value=numbers_min_value,
+                numbers_no_suffix=numbers_no_suffix,
+            )
 
-        #
-        # User text post processing (when found).
-        #
-        if user_config is not None:
-            text = process_text_with_user_config(user_config, text)
+            #
+            # User text post processing (when found).
+            #
+            if user_config is not None:
+                text = process_text_with_user_config(user_config, text)
 
-        if is_run_on:
-            # This is a signal that the end of the sentence has been reached.
-            if full_sentence:
-                text = ". " + text
-            else:
-                text = ", " + text
+            if is_run_on:
+                # This is a signal that the end of the sentence has been reached.
+                if full_sentence:
+                    text = ". " + text
+                else:
+                    text = ", " + text
 
-        process_fn_is_first = False
+            process_fn_is_first = False
 
-        return text
+            return text
 
     #
     # Handled the resulting text
     #
     if output == "SIMULATE_INPUT":
         if simulate_input_tool == "XDOTOOL":
-            handle_fn = simulate_typing_with_xdotool
+            sink: TextSink = XdotoolTextSink()
         elif simulate_input_tool == "YDOTOOL":
-            handle_fn = simulate_typing_with_ydotool
+            sink = YdotoolTextSink()
         elif simulate_input_tool == "DOTOOL":
-            handle_fn = simulate_typing_with_dotool
+            sink = DotoolTextSink()
         elif simulate_input_tool == "DOTOOLC":
-            handle_fn = simulate_typing_with_dotoolc
+            sink = DotoolcTextSink()
         elif simulate_input_tool == "WTYPE":
-            handle_fn = simulate_typing_with_wtype
+            sink = WtypeTextSink()
         elif simulate_input_tool == "STDOUT":
-            handle_fn = simulate_typing_with_stdout
+            sink = StdoutTextSink()
         else:
             raise Exception("Internal error, unknown input tool: {!r}".format(simulate_input_tool))
 
     elif output == "STDOUT":
-
-        def handle_fn(delete_prev_chars: int, text: str) -> None:
-            # No setup/tear-down.
-            if delete_prev_chars == SIMULATE_INPUT_CODE_COMMAND:
-                return
-
-            if delete_prev_chars:
-                sys.stdout.write("\x08" * delete_prev_chars)
-            sys.stdout.write(text)
+        sink = StdoutTextSink()
 
     else:
         # Unreachable.
         assert False
+
+    text_output = TextOutput(
+        sink=sink,
+        process_fn=process_fn,
+        progressive=progressive,
+        progressive_continuous=progressive_continuous,
+        stable_partial_prefix=asr_engine == "QWEN",
+    )
 
     if asr_engine == "QWEN":
         found_any = text_from_qwen_pipe(
@@ -2195,11 +2463,9 @@ def main_begin(
             input_method=input_method,
             timeout=timeout,
             idle_time=idle_time,
-            progressive=progressive,
-            progressive_continuous=progressive_continuous,
             exit_fn=exit_fn,
             process_fn=process_fn,
-            handle_fn=handle_fn,
+            text_output=text_output,
             suspend_on_start=suspend_on_start,
             verbose=verbose,
         )
@@ -2211,11 +2477,9 @@ def main_begin(
             input_method=input_method,
             timeout=timeout,
             idle_time=idle_time,
-            progressive=progressive,
-            progressive_continuous=progressive_continuous,
             exit_fn=exit_fn,
             process_fn=process_fn,
-            handle_fn=handle_fn,
+            text_output=text_output,
             suspend_on_start=suspend_on_start,
             verbose=verbose,
             vosk_grammar_file=vosk_grammar_file,
