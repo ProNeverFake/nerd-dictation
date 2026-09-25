@@ -73,6 +73,7 @@ Dependencies
 
 - Python 3.6 (or newer).
 - The VOSK-API.
+- The ``websockets`` Python package when using the optional Qwen backend.
 - An audio recording utility (``parec`` by default).
 - An input simulation utility (``xdotool`` by default).
 
@@ -135,6 +136,43 @@ To test dictation:
 
 
 If you prefer to use a package, see: `Packaging <package/readme.rst>`_.
+
+
+Qwen Backend
+------------
+
+An optional online backend supports Alibaba Cloud Model Studio (DashScope)
+real-time ASR models.  Vosk remains the default.
+
+Install the optional WebSocket dependency:
+
+.. code-block:: sh
+
+   pip3 install 'websockets>=13'
+
+Then configure the API key and select a model:
+
+.. code-block:: sh
+
+   export DASHSCOPE_API_KEY='sk-...'
+   ./nerd-dictation begin --asr-engine=QWEN --qwen-model=message
+   ./nerd-dictation end
+
+The available aliases are:
+
+- ``message``: ``qwen-audio-3.1-asr-flash-message``, optimized for voice
+  messages and input methods.
+- ``streaming``: ``qwen-audio-3.1-asr-flash-streaming``, the general
+  real-time streaming model.
+
+Switch models by changing ``--qwen-model=message`` to
+``--qwen-model=streaming``.  Qwen audio is sent to Alibaba Cloud, so this
+backend requires a network connection and is not an offline replacement.
+
+See
+`Qwen ASR Backend <docs/qwen-backend.md>`_ for setup and options.  For an
+Ubuntu F9 toggle shortcut, see
+`F9 Toggle Shortcut <docs/ubuntu-f9-shortcut.md>`_.
 
 
 Configuration
@@ -202,7 +240,12 @@ Subcommand: ``begin``
 usage::
 
        nerd-dictation begin [-h] [--cookie FILE_PATH] [--config FILE]
-                            [--vosk-model-dir DIR] [--vosk-grammar-file DIR]
+                            [--asr-engine ENGINE] [--vosk-model-dir DIR]
+                            [--vosk-grammar-file DIR] [--qwen-model MODEL]
+                            [--qwen-base-url URL] [--qwen-api-key-env ENV_VAR]
+                            [--qwen-polish] [--qwen-heartbeat]
+                            [--qwen-max-sentence-silence MILLISECONDS]
+                            [--qwen-final-timeout SECONDS]
                             [--pulse-device-name IDENTIFIER]
                             [--sample-rate HZ] [--defer-output] [--continuous]
                             [--timeout SECONDS] [--idle-time SECONDS]
@@ -223,16 +266,33 @@ options:
   --cookie FILE_PATH    Location for writing a temporary cookie (this file is monitored to begin/end dictation).
   --config FILE         Override the file used for the user configuration.
                         Use an empty string to prevent the users configuration being read.
+  --asr-engine ENGINE   Speech recognition backend to use.
+
+                        - ``VOSK``: local offline recognition using a Vosk model directory (default).
+                        - ``QWEN``: streaming Alibaba Cloud Model Studio (DashScope) recognition.
   --vosk-model-dir DIR  Path to the VOSK model, see: https://alphacephei.com/vosk/models
   --vosk-grammar-file DIR
                         Path to a JSON grammar file.  This restricts the phrases recognized by VOSK for
                         better accuracy.  See `vosk_recognizer_new_grm` in the API reference:
                         https://github.com/alphacep/vosk-api/blob/master/src/vosk_api.h
+  --qwen-model MODEL    Qwen ASR model id. Aliases are available for testing:
+
+                        - ``message``: qwen-audio-3.1-asr-flash-message (default).
+                        - ``streaming``: qwen-audio-3.1-asr-flash-streaming.
+  --qwen-base-url URL   Qwen WebSocket endpoint. Use the workspace-specific endpoint when available.
+  --qwen-api-key-env ENV_VAR
+                        Environment variable that contains the Qwen API key.
+  --qwen-polish         Enable native disfluency removal and polishing for the message model.
+  --qwen-heartbeat      Keep a long-running Qwen task alive with heartbeat events while silence is sent.
+  --qwen-max-sentence-silence MILLISECONDS
+                        Qwen VAD sentence boundary silence threshold, from 200 to 6000 ms.
+  --qwen-final-timeout SECONDS
+                        Maximum time to wait for final Qwen results after recording stops.
   --pulse-device-name IDENTIFIER
                         The name of the pulse-audio device to use for recording.
                         See the output of "pactl list sources" to find device names (using the identifier following "Name:").
   --sample-rate HZ      The sample rate to use for recording (in Hz).
-                        Defaults to 44100.
+                        Defaults to 16000 for the Qwen backend and 44100 for Vosk.
   --defer-output        When enabled, output is deferred until exiting.
 
                         This prevents text being typed during speech (implied with ``--output=STDOUT``)

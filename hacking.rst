@@ -15,7 +15,7 @@ Code Base
 This code base is designed to be easily hacked on.
 
 - Single file code-base (the contents of ``nerd-dictation``).
-- Only built in modules are used (besides ``vosk`` for speech to text).
+- Only built in modules are used besides ``vosk`` and the optional ``websockets`` dependency for the Qwen backend.
 - So far this has only tested on Linux/X11
   *(support for other platforms may be added in the future).*
 

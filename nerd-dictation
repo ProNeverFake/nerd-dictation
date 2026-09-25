@@ -10,15 +10,21 @@ While it could use any system currently it uses the VOSK-API.
 
 # All built in modules.
 import argparse
+import json
 import os
+import signal
 import stat
 import subprocess
 import sys
+import queue
+import threading
 import tempfile
 import time
+import uuid
 
 # Types.
 from typing import (
+    Any,
     Dict,
     IO,
     List,
@@ -38,6 +44,14 @@ USER_CONFIG_DIR = "nerd-dictation"
 USER_CONFIG = "nerd-dictation.py"
 
 SIMULATE_INPUT_CODE_COMMAND = -1
+
+QWEN_MODEL_ALIASES = {
+    "message": "qwen-audio-3.1-asr-flash-message",
+    "streaming": "qwen-audio-3.1-asr-flash-streaming",
+}
+
+QWEN_DEFAULT_MODEL = QWEN_MODEL_ALIASES["message"]
+QWEN_DEFAULT_BASE_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 
 
 # -----------------------------------------------------------------------------
@@ -860,6 +874,73 @@ def process_text(
 
 
 # -----------------------------------------------------------------------------
+# Progressive Text Output
+#
+
+
+class ProgressiveTextOutput:
+    def __init__(
+        self,
+        *,
+        handle_fn: Callable[[int, str], None],
+        process_fn: Callable[[str], str],
+        progressive: bool,
+        progressive_continuous: bool,
+    ) -> None:
+        self.handle_fn = handle_fn
+        self.process_fn = process_fn
+        self.progressive = progressive
+        self.progressive_continuous = progressive_continuous
+        self.text_list: List[str] = []
+        self.text_prev = ""
+        self.handled_any = False
+
+    def reset(self) -> None:
+        self.handled_any = False
+        self.text_prev = ""
+        self.text_list.clear()
+
+    def handle(self, text: str, is_partial: bool) -> None:
+        # Simple deferred text input, just accumulate values in a list (finish entering text on exit).
+        if not self.progressive:
+            if is_partial:
+                return
+            self.text_list.append(text)
+            self.handled_any = True
+            return
+
+        # Progressive support (type as you speak).
+        if self.progressive_continuous:
+            text_curr = self.process_fn(text)
+        else:
+            text_curr = self.process_fn(" ".join(self.text_list + [text]))
+
+        if text_curr != self.text_prev:
+            match = min(len(text_curr), len(self.text_prev))
+            for i in range(min(len(text_curr), len(self.text_prev))):
+                if text_curr[i] != self.text_prev[i]:
+                    match = i
+                    break
+
+            # Emit text, deleting any previous incorrectly transcribed output.
+            self.handle_fn(len(self.text_prev) - match, text_curr[match:])
+            self.text_prev = text_curr
+
+        if not is_partial:
+            if self.progressive_continuous:
+                self.text_prev = ""
+            else:
+                self.text_list.append(text)
+
+        self.handled_any = True
+
+    def emit_deferred(self) -> None:
+        if not self.progressive:
+            # We never arrive here needing deletions.
+            self.handle_fn(0, self.process_fn(" ".join(self.text_list)))
+
+
+# -----------------------------------------------------------------------------
 # Text from VOSK
 #
 
@@ -993,71 +1074,15 @@ def text_from_vosk_pipe(
         timeout_text_prev = ""
         timeout_time_prev = time.time()
 
-    # Collect the output used when time-out is enabled.
-    if not (progressive and progressive_continuous):
-        text_list: List[str] = []
-
-    # Set true if handle has been called.
-    handled_any = False
-
-    if progressive:
-        text_prev = ""
+    text_output = ProgressiveTextOutput(
+        handle_fn=handle_fn,
+        process_fn=process_fn,
+        progressive=progressive,
+        progressive_continuous=progressive_continuous,
+    )
 
     # Track this to prevent excessive load when the "partial" result doesn't change.
     json_text_partial_prev = ""
-
-    # -----------------------------
-    # Utilities for Text Processing
-
-    def handle_fn_suspended() -> None:
-        nonlocal handled_any
-        nonlocal text_prev
-        nonlocal json_text_partial_prev
-
-        handled_any = False
-        text_prev = ""
-        json_text_partial_prev = ""
-
-        if not (progressive and progressive_continuous):
-            text_list.clear()
-
-    def handle_fn_wrapper(text: str, is_partial_arg: bool) -> None:
-        nonlocal handled_any
-        nonlocal text_prev
-
-        # Simple deferred text input, just accumulate values in a list (finish entering text on exit).
-        if not progressive:
-            if is_partial_arg:
-                return
-            text_list.append(text)
-            handled_any = True
-            return
-
-        # Progressive support (type as you speak).
-        if progressive_continuous:
-            text_curr = process_fn(text)
-        else:
-            text_curr = process_fn(" ".join(text_list + [text]))
-
-        if text_curr != text_prev:
-            match = min(len(text_curr), len(text_prev))
-            for i in range(min(len(text_curr), len(text_prev))):
-                if text_curr[i] != text_prev[i]:
-                    match = i
-                    break
-
-            # Emit text, deleting any previous incorrectly transcribed output
-            handle_fn(len(text_prev) - match, text_curr[match:])
-
-            text_prev = text_curr
-
-        if not is_partial_arg:
-            if progressive_continuous:
-                text_prev = ""
-            else:
-                text_list.append(text)
-
-        handled_any = True
 
     # -----------------------------------------------
     # Utilities for accessing results on `rec` (VOSK)
@@ -1076,7 +1101,7 @@ def text_from_vosk_pipe(
         text = json_data["text"]
         assert isinstance(text, str)
         if text:
-            handle_fn_wrapper(text, False)
+            text_output.handle(text, False)
         return json_text
 
     def rec_handle_fn_wrapper_from_partial_result(json_text_partial_prev: str) -> Tuple[str, str]:
@@ -1089,7 +1114,7 @@ def text_from_vosk_pipe(
             # In rare cases this can be unset (when resuming from being suspended).
             text = json_data.get("partial", "")
             if text:
-                handle_fn_wrapper(text, True)
+                text_output.handle(text, True)
         return json_text, json_text_partial_prev
 
     if not suspend_on_start:
@@ -1114,7 +1139,7 @@ def text_from_vosk_pipe(
         rec.Reset()
 
         # Clear the buffer:
-        handle_fn_suspended()
+        text_output.reset()
 
         nonlocal verbose
         if verbose >= 1:
@@ -1191,7 +1216,7 @@ def text_from_vosk_pipe(
 
     while code == 0:
         # -1=cancel, 0=continue, 1=finish.
-        code = exit_fn(handled_any)
+        code = exit_fn(text_output.handled_any)
 
         # Note that when suspend is enabled the entire process is suspended
         # and this look should not run.
@@ -1259,11 +1284,603 @@ def text_from_vosk_pipe(
     # This writes many JSON blocks, use the last one.
     rec_handle_fn_wrapper_from_final_result()
 
-    if not progressive:
-        # We never arrive here needing deletions
-        handle_fn(0, process_fn(" ".join(text_list)))
+    text_output.emit_deferred()
 
-    return handled_any
+    return text_output.handled_any
+
+
+class QwenTranscriptState:
+    def __init__(self) -> None:
+        self.last_final_sentence_id = 0
+        self.current_sentence_id = 0
+        self.current_text = ""
+
+    def consume(self, sentence: Dict[str, object]) -> "Optional[Tuple[str, bool]]":
+        if sentence.get("heartbeat") is True:
+            return None
+
+        sentence_id = sentence.get("sentence_id")
+        if not isinstance(sentence_id, int):
+            return None
+        if sentence_id <= self.last_final_sentence_id:
+            return None
+
+        text = sentence.get("text", "")
+        if not isinstance(text, str):
+            return None
+
+        is_final = sentence.get("sentence_end") is True
+        if is_final:
+            self.last_final_sentence_id = sentence_id
+            if self.current_sentence_id == sentence_id:
+                self.current_sentence_id = 0
+                self.current_text = ""
+            if not text:
+                return None
+            return text, True
+
+        self.current_sentence_id = sentence_id
+        self.current_text = text
+        if not text:
+            return None
+        return text, False
+
+    def finish(self) -> "Optional[Tuple[str, bool]]":
+        if self.current_sentence_id <= self.last_final_sentence_id:
+            return None
+        if not self.current_text:
+            return None
+        text = self.current_text
+        self.last_final_sentence_id = self.current_sentence_id
+        self.current_sentence_id = 0
+        self.current_text = ""
+        return text, True
+
+
+def qwen_model_id_from_arg(model_arg: str) -> str:
+    return QWEN_MODEL_ALIASES.get(model_arg, model_arg)
+
+
+def qwen_run_task_payload(
+    *,
+    model: str,
+    sample_rate: int,
+    polish: bool,
+    heartbeat: bool,
+    max_sentence_silence: Optional[int],
+    task_id: str,
+) -> Dict[str, object]:
+    parameters: Dict[str, object] = {
+        "format": "pcm",
+        "sample_rate": sample_rate,
+    }
+
+    if model == QWEN_MODEL_ALIASES["message"]:
+        parameters["intermediate_result_enabled"] = True
+        if polish:
+            parameters["disfluency_removal_enabled"] = True
+    elif model == QWEN_MODEL_ALIASES["streaming"]:
+        # The streaming model always returns intermediate results.
+        pass
+
+    if heartbeat:
+        parameters["heartbeat"] = True
+    if max_sentence_silence is not None:
+        parameters["max_sentence_silence"] = max_sentence_silence
+
+    return {
+        "header": {
+            "action": "run-task",
+            "task_id": task_id,
+            "streaming": "duplex",
+        },
+        "payload": {
+            "task_group": "audio",
+            "task": "asr",
+            "function": "recognition",
+            "model": model,
+            "parameters": parameters,
+            "input": {},
+        },
+    }
+
+
+class QwenWebSocketClient:
+    def __init__(
+        self,
+        *,
+        model: str,
+        base_url: str,
+        api_key: str,
+        sample_rate: int,
+        polish: bool,
+        heartbeat: bool,
+        max_sentence_silence: Optional[int],
+        audio_queue_size: int,
+    ) -> None:
+        self.model = model
+        self.base_url = base_url
+        self.api_key = api_key
+        self.sample_rate = sample_rate
+        self.polish = polish
+        self.heartbeat = heartbeat
+        self.max_sentence_silence = max_sentence_silence
+        self.task_id = str(uuid.uuid4())
+
+        self.audio_queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=audio_queue_size)
+        self.event_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue()
+
+        self.cancel_event = threading.Event()
+        self.thread = threading.Thread(target=self._thread_main, daemon=True)
+        self.session_loop: Optional[Any] = None
+        self.session_task: Optional[Any] = None
+        self.session_lock = threading.Lock()
+        self.error_lock = threading.Lock()
+        self.error_reported = False
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def send_audio(self, data: bytes) -> None:
+        self.audio_queue.put_nowait(data)
+
+    def finish(self) -> None:
+        while not self.cancel_event.is_set() and self.thread.is_alive():
+            try:
+                self.audio_queue.put(None, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+        with self.session_lock:
+            loop = self.session_loop
+            task = self.session_task
+        if loop is not None and task is not None:
+            loop.call_soon_threadsafe(task.cancel)
+
+    def join(self, timeout: float = 2.0) -> None:
+        self.thread.join(timeout)
+
+    def _report_error(self, message: str) -> None:
+        with self.error_lock:
+            if self.error_reported:
+                return
+            self.error_reported = True
+        self.event_queue.put(("error", message))
+
+    def _thread_main(self) -> None:
+        import asyncio
+
+        try:
+            asyncio.run(self._run_session())
+        except asyncio.CancelledError:
+            pass
+        except Exception as ex:
+            self._report_error(str(ex))
+
+    async def _wait_for_task_started(self, websocket: Any) -> bool:
+        import asyncio
+
+        while not self.cancel_event.is_set():
+            try:
+                raw_message = await asyncio.wait_for(websocket.recv(), timeout=15.0)
+            except asyncio.TimeoutError:
+                self._report_error("Timed out waiting for the Qwen task to start.")
+                return False
+            if isinstance(raw_message, bytes):
+                continue
+            message = json.loads(raw_message)
+            header = message.get("header", {})
+            event = header.get("event")
+            if event == "task-started":
+                self.event_queue.put(("started", {}))
+                return True
+            if event == "task-failed":
+                error_message = header.get("error_message", "Qwen task failed before start")
+                self._report_error(str(error_message))
+                return False
+        return False
+
+    async def _send_audio(self, websocket: Any) -> None:
+        import asyncio
+
+        while not self.cancel_event.is_set():
+            try:
+                data = self.audio_queue.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+                continue
+
+            if data is None:
+                finish_payload = {
+                    "header": {
+                        "action": "finish-task",
+                        "task_id": self.task_id,
+                        "streaming": "duplex",
+                    },
+                    "payload": {"input": {}},
+                }
+                await websocket.send(json.dumps(finish_payload, ensure_ascii=False))
+                return
+
+            await websocket.send(data)
+
+    async def _receive_events(self, websocket: Any) -> None:
+        async for raw_message in websocket:
+            if isinstance(raw_message, bytes):
+                continue
+            message = json.loads(raw_message)
+            header = message.get("header", {})
+            event = header.get("event")
+
+            if event == "result-generated":
+                self.event_queue.put(("result", message))
+                continue
+            if event == "task-finished":
+                self.event_queue.put(("finished", message))
+                return
+            if event == "task-failed":
+                error_message = header.get("error_message", "Qwen task failed")
+                self._report_error(str(error_message))
+                return
+
+        if not self.cancel_event.is_set():
+            self._report_error("Qwen WebSocket connection closed before task-finished.")
+
+    async def _run_session(self) -> None:
+        import asyncio
+
+        try:
+            from websockets.asyncio.client import connect
+        except ImportError:
+            self._report_error("The 'websockets' package is required for the Qwen backend.")
+            return
+
+        task = asyncio.current_task()
+        with self.session_lock:
+            self.session_loop = asyncio.get_running_loop()
+            self.session_task = task
+
+        try:
+            headers = {
+                "Authorization": "Bearer {:s}".format(self.api_key),
+                "user-agent": "nerd-dictation/1.0",
+            }
+            run_task = qwen_run_task_payload(
+                model=self.model,
+                sample_rate=self.sample_rate,
+                polish=self.polish,
+                heartbeat=self.heartbeat,
+                max_sentence_silence=self.max_sentence_silence,
+                task_id=self.task_id,
+            )
+
+            async with connect(self.base_url, additional_headers=headers, max_size=None) as websocket:
+                await websocket.send(json.dumps(run_task, ensure_ascii=False))
+                if not await self._wait_for_task_started(websocket):
+                    return
+
+                sender_task = asyncio.create_task(self._send_audio(websocket))
+                receiver_task = asyncio.create_task(self._receive_events(websocket))
+                try:
+                    await asyncio.gather(sender_task, receiver_task)
+                finally:
+                    for pending_task in (sender_task, receiver_task):
+                        if not pending_task.done():
+                            pending_task.cancel()
+                    await asyncio.gather(sender_task, receiver_task, return_exceptions=True)
+        finally:
+            with self.session_lock:
+                self.session_loop = None
+                self.session_task = None
+
+
+def qwen_audio_chunks(data: bytes, chunk_size: int = 3200) -> "List[bytes]":
+    return [data[offset : offset + chunk_size] for offset in range(0, len(data), chunk_size)]
+
+
+def text_from_qwen_pipe(
+    *,
+    qwen_model: str,
+    qwen_base_url: str,
+    qwen_api_key: str,
+    qwen_polish: bool,
+    qwen_heartbeat: bool,
+    qwen_max_sentence_silence: Optional[int],
+    qwen_final_timeout: float,
+    exit_fn: Callable[..., int],
+    process_fn: Callable[[str], str],
+    handle_fn: Callable[[int, str], None],
+    timeout: float,
+    idle_time: float,
+    progressive: bool,
+    progressive_continuous: bool,
+    sample_rate: int,
+    input_method: str,
+    pulse_device_name: str = "",
+    suspend_on_start: bool = False,
+    verbose: int = 0,
+) -> bool:
+    if not qwen_api_key:
+        sys.stderr.write("Qwen backend requires an API key in the configured environment variable.\n")
+        sys.exit(1)
+
+    if qwen_model == QWEN_MODEL_ALIASES["message"] and sample_rate != 16000:
+        sys.stderr.write("The Qwen message model only supports a 16000 Hz sample rate.\n")
+        sys.exit(1)
+
+    if qwen_final_timeout <= 0.0:
+        sys.stderr.write("--qwen-final-timeout must be greater than zero.\n")
+        sys.exit(1)
+
+    if qwen_max_sentence_silence is not None and not (200 <= qwen_max_sentence_silence <= 6000):
+        sys.stderr.write("--qwen-max-sentence-silence must be between 200 and 6000 milliseconds.\n")
+        sys.exit(1)
+
+    def recording_proc_start() -> "Tuple[subprocess.Popen[bytes], IO[bytes]]":
+        return recording_proc_with_non_blocking_stdout(input_method, sample_rate, pulse_device_name)
+
+    has_ps = False
+    if not suspend_on_start:
+        ps, stdout = recording_proc_start()
+        has_ps = True
+
+    text_output = ProgressiveTextOutput(
+        handle_fn=handle_fn,
+        process_fn=process_fn,
+        progressive=progressive,
+        progressive_continuous=progressive_continuous,
+    )
+    transcript_state = QwenTranscriptState()
+    def create_qwen_client() -> QwenWebSocketClient:
+        return QwenWebSocketClient(
+            model=qwen_model,
+            base_url=qwen_base_url,
+            api_key=qwen_api_key,
+            sample_rate=sample_rate,
+            polish=qwen_polish,
+            heartbeat=qwen_heartbeat,
+            max_sentence_silence=qwen_max_sentence_silence,
+            audio_queue_size=512,
+        )
+
+    qwen_client = create_qwen_client()
+
+    if verbose >= 1:
+        sys.stderr.write("Connecting to Qwen ASR model {!r}...\n".format(qwen_model))
+    if not suspend_on_start:
+        qwen_client.start()
+
+    input_setup = not suspend_on_start
+    if not suspend_on_start:
+        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "SETUP")
+
+    def teardown_input() -> None:
+        nonlocal input_setup
+        if not input_setup:
+            return
+        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "TEARDOWN")
+        input_setup = False
+
+    def close_recording(flush_audio: bool) -> None:
+        nonlocal has_ps
+        nonlocal ps
+        nonlocal stdout
+        if not has_ps:
+            return
+
+        if flush_audio:
+            try:
+                empty_reads = 0
+                while empty_reads < 3:
+                    data = stdout.read(block_size)
+                    if not data:
+                        empty_reads += 1
+                        time.sleep(0.01)
+                        continue
+                    empty_reads = 0
+                    for audio_chunk in qwen_audio_chunks(data):
+                        qwen_client.send_audio(audio_chunk)
+            except (BlockingIOError, NameError, ValueError):
+                pass
+            except queue.Full:
+                pass
+
+        stdout.close()
+        os.kill(ps.pid, signal.SIGINT)
+        del stdout, ps
+        has_ps = False
+
+    def do_suspend_pause() -> None:
+        nonlocal qwen_client
+        nonlocal transcript_state
+
+        text_output.emit_deferred()
+        text_output.reset()
+        transcript_state = QwenTranscriptState()
+        qwen_client.cancel()
+        qwen_client.join()
+        close_recording(flush_audio=False)
+
+        if verbose >= 1:
+            sys.stderr.write("Recording suspended.\n")
+
+        teardown_input()
+
+    def do_suspend_resume() -> None:
+        nonlocal has_ps
+        nonlocal ps
+        nonlocal stdout
+        nonlocal qwen_client
+        nonlocal transcript_state
+
+        if verbose >= 1:
+            sys.stderr.write("Recording.\n")
+
+        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "SETUP")
+        input_setup = True
+        ps, stdout = recording_proc_start()
+        has_ps = True
+        transcript_state = QwenTranscriptState()
+        qwen_client = create_qwen_client()
+        qwen_client.start()
+
+    from types import FrameType
+
+    suspend = suspend_on_start
+
+    def handle_sig_suspend_from_usr1(_signum: int, _frame: Optional[FrameType]) -> None:
+        nonlocal suspend
+        if suspend:
+            return
+        suspend = True
+        do_suspend_pause()
+        os.kill(os.getpid(), signal.SIGSTOP)
+
+    def handle_sig_resume_from_cont(_signum: int, _frame: Optional[FrameType]) -> None:
+        nonlocal suspend
+        if not suspend:
+            return
+        suspend = False
+
+    def handle_sig_reload_from_hup(_signum: int, _frame: Optional[FrameType]) -> None:
+        if verbose >= 1:
+            sys.stderr.write("Reload.\n")
+        process_fn("")
+
+    signal.signal(signal.SIGUSR1, handle_sig_suspend_from_usr1)
+    signal.signal(signal.SIGTSTP, handle_sig_suspend_from_usr1)
+    signal.signal(signal.SIGCONT, handle_sig_resume_from_cont)
+    signal.signal(signal.SIGHUP, handle_sig_reload_from_hup)
+
+    if suspend:
+        os.kill(os.getpid(), signal.SIGSTOP)
+
+    use_timeout = timeout != 0.0
+    timeout_time_prev = time.time()
+    code = 0
+    qwen_error = ""
+    qwen_finished = False
+    block_size = 3200
+
+    while code == 0:
+        code = exit_fn(text_output.handled_any)
+        if suspend:
+            time.sleep(0.05)
+            continue
+
+        while True:
+            try:
+                event_type, event_data = qwen_client.event_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if event_type == "result":
+                message = event_data
+                assert isinstance(message, dict)
+                sentence = message.get("payload", {}).get("output", {}).get("sentence", {})
+                if isinstance(sentence, dict):
+                    update = transcript_state.consume(sentence)
+                    if update is not None:
+                        text_output.handle(update[0], not update[1])
+                        timeout_time_prev = time.time()
+            elif event_type == "finished":
+                qwen_finished = True
+            elif event_type == "error":
+                qwen_error = str(event_data)
+                code = 2
+                break
+
+        if code != 0:
+            break
+
+        if qwen_finished:
+            code = 1
+            break
+
+        if use_timeout and time.time() - timeout_time_prev > timeout:
+            code = 1
+            break
+
+        if idle_time > 0.0:
+            time.sleep(idle_time)
+
+        try:
+            data = stdout.read(block_size)
+        except BlockingIOError:
+            continue
+        except (NameError, ValueError):
+            do_suspend_resume()
+            continue
+
+        if data:
+            try:
+                for audio_chunk in qwen_audio_chunks(data):
+                    qwen_client.send_audio(audio_chunk)
+            except queue.Full:
+                qwen_error = "Qwen audio queue is full; the network connection cannot keep up."
+                code = 2
+                break
+
+    if code == -1:
+        close_recording(flush_audio=False)
+        qwen_client.cancel()
+        qwen_client.join()
+        teardown_input()
+        sys.stderr.write("Text input canceled!\n")
+        sys.exit(0)
+
+    if code == 2:
+        close_recording(flush_audio=False)
+        qwen_client.cancel()
+        qwen_client.join()
+        teardown_input()
+        sys.stderr.write("Qwen ASR error: {!s}\n".format(qwen_error))
+        return text_output.handled_any
+
+    close_recording(flush_audio=True)
+    qwen_client.finish()
+    final_deadline = time.time() + qwen_final_timeout
+    while time.time() < final_deadline and not qwen_finished and not qwen_error:
+        while True:
+            try:
+                event_type, event_data = qwen_client.event_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if event_type == "result":
+                message = event_data
+                assert isinstance(message, dict)
+                sentence = message.get("payload", {}).get("output", {}).get("sentence", {})
+                if isinstance(sentence, dict):
+                    update = transcript_state.consume(sentence)
+                    if update is not None:
+                        text_output.handle(update[0], not update[1])
+            elif event_type == "finished":
+                qwen_finished = True
+            elif event_type == "error":
+                qwen_error = str(event_data)
+
+        if not qwen_finished and not qwen_error:
+            time.sleep(0.01)
+
+    final_update = transcript_state.finish()
+    if final_update is not None:
+        text_output.handle(final_update[0], not final_update[1])
+
+    qwen_client.cancel()
+    qwen_client.join()
+    teardown_input()
+
+    if qwen_error:
+        sys.stderr.write("Qwen ASR error: {!s}\n".format(qwen_error))
+    elif not qwen_finished:
+        sys.stderr.write("Qwen ASR did not finish before the timeout.\n")
+
+    text_output.emit_deferred()
+    return text_output.handled_any
 
 
 def main_begin(
@@ -1271,8 +1888,16 @@ def main_begin(
     vosk_model_dir: str,
     path_to_cookie: str = "",
     pulse_device_name: str = "",
-    sample_rate: int = 44100,
+    sample_rate: Optional[int] = None,
     input_method: str = "PAREC",
+    asr_engine: str = "VOSK",
+    qwen_model: str = QWEN_DEFAULT_MODEL,
+    qwen_base_url: str = QWEN_DEFAULT_BASE_URL,
+    qwen_api_key_env: str = "DASHSCOPE_API_KEY",
+    qwen_polish: bool = False,
+    qwen_heartbeat: bool = False,
+    qwen_max_sentence_silence: Optional[int] = None,
+    qwen_final_timeout: float = 10.0,
     progressive: bool = False,
     progressive_continuous: bool = False,
     full_sentence: bool = False,
@@ -1296,6 +1921,9 @@ def main_begin(
 
     This is terminated by the ``end`` or ``cancel`` actions.
     """
+
+    if sample_rate is None:
+        sample_rate = 16000 if asr_engine == "QWEN" else 44100
 
     # Find language model in:
     # - `--vosk-model-dir=...`
@@ -1442,22 +2070,45 @@ def main_begin(
         # Unreachable.
         assert False
 
-    found_any = text_from_vosk_pipe(
-        vosk_model_dir=vosk_model_dir,
-        pulse_device_name=pulse_device_name,
-        sample_rate=sample_rate,
-        input_method=input_method,
-        timeout=timeout,
-        idle_time=idle_time,
-        progressive=progressive,
-        progressive_continuous=progressive_continuous,
-        exit_fn=exit_fn,
-        process_fn=process_fn,
-        handle_fn=handle_fn,
-        suspend_on_start=suspend_on_start,
-        verbose=verbose,
-        vosk_grammar_file=vosk_grammar_file,
-    )
+    if asr_engine == "QWEN":
+        found_any = text_from_qwen_pipe(
+            qwen_model=qwen_model,
+            qwen_base_url=qwen_base_url,
+            qwen_api_key=os.environ.get(qwen_api_key_env, ""),
+            qwen_polish=qwen_polish,
+            qwen_heartbeat=qwen_heartbeat,
+            qwen_max_sentence_silence=qwen_max_sentence_silence,
+            qwen_final_timeout=qwen_final_timeout,
+            pulse_device_name=pulse_device_name,
+            sample_rate=sample_rate,
+            input_method=input_method,
+            timeout=timeout,
+            idle_time=idle_time,
+            progressive=progressive,
+            progressive_continuous=progressive_continuous,
+            exit_fn=exit_fn,
+            process_fn=process_fn,
+            handle_fn=handle_fn,
+            suspend_on_start=suspend_on_start,
+            verbose=verbose,
+        )
+    else:
+        found_any = text_from_vosk_pipe(
+            vosk_model_dir=vosk_model_dir,
+            pulse_device_name=pulse_device_name,
+            sample_rate=sample_rate,
+            input_method=input_method,
+            timeout=timeout,
+            idle_time=idle_time,
+            progressive=progressive,
+            progressive_continuous=progressive_continuous,
+            exit_fn=exit_fn,
+            process_fn=process_fn,
+            handle_fn=handle_fn,
+            suspend_on_start=suspend_on_start,
+            verbose=verbose,
+            vosk_grammar_file=vosk_grammar_file,
+        )
 
     if not found_any:
         sys.stderr.write("No text found in the audio\n")
@@ -1562,6 +2213,21 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
     )
 
     subparse.add_argument(
+        "--asr-engine",
+        dest="asr_engine",
+        default="VOSK",
+        choices=("VOSK", "QWEN"),
+        metavar="ENGINE",
+        help=(
+            "Speech recognition backend to use.\n"
+            "\n"
+            "- ``VOSK``: local offline recognition using a Vosk model directory (default).\n"
+            "- ``QWEN``: streaming Alibaba Cloud Model Studio (DashScope) recognition.\n"
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
         "--vosk-model-dir",
         default="",
         dest="vosk_model_dir",
@@ -1586,6 +2252,79 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
     )
 
     subparse.add_argument(
+        "--qwen-model",
+        dest="qwen_model",
+        default=QWEN_DEFAULT_MODEL,
+        type=str,
+        metavar="MODEL",
+        help=(
+            "Qwen ASR model id. Aliases are available for testing:\n"
+            "\n"
+            "- ``message``: qwen-audio-3.1-asr-flash-message (default).\n"
+            "- ``streaming``: qwen-audio-3.1-asr-flash-streaming.\n"
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--qwen-base-url",
+        dest="qwen_base_url",
+        default=QWEN_DEFAULT_BASE_URL,
+        type=str,
+        metavar="URL",
+        help="Qwen WebSocket endpoint. Use the workspace-specific endpoint when available.",
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--qwen-api-key-env",
+        dest="qwen_api_key_env",
+        default="DASHSCOPE_API_KEY",
+        type=str,
+        metavar="ENV_VAR",
+        help="Environment variable that contains the Qwen API key.",
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--qwen-polish",
+        dest="qwen_polish",
+        default=False,
+        action="store_true",
+        help="Enable native disfluency removal and polishing for the message model.",
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--qwen-heartbeat",
+        dest="qwen_heartbeat",
+        default=False,
+        action="store_true",
+        help="Keep a long-running Qwen task alive with heartbeat events while silence is sent.",
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--qwen-max-sentence-silence",
+        dest="qwen_max_sentence_silence",
+        default=None,
+        type=int,
+        metavar="MILLISECONDS",
+        help="Qwen VAD sentence boundary silence threshold, from 200 to 6000 ms.",
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--qwen-final-timeout",
+        dest="qwen_final_timeout",
+        default=10.0,
+        type=float,
+        metavar="SECONDS",
+        help="Maximum time to wait for final Qwen results after recording stops.",
+        required=False,
+    )
+
+    subparse.add_argument(
         "--pulse-device-name",
         dest="pulse_device_name",
         default="",
@@ -1601,10 +2340,13 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
     subparse.add_argument(
         "--sample-rate",
         dest="sample_rate",
-        default=44100,
+        default=None,
         type=int,
         metavar="HZ",
-        help=("The sample rate to use for recording (in Hz).\n" "Defaults to 44100."),
+        help=(
+            "The sample rate to use for recording (in Hz).\n"
+            "Defaults to 16000 for the Qwen backend and 44100 for Vosk."
+        ),
         required=False,
     )
 
@@ -1847,6 +2589,14 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             pulse_device_name=args.pulse_device_name,
             sample_rate=args.sample_rate,
             input_method=args.input_method,
+            asr_engine=args.asr_engine,
+            qwen_model=qwen_model_id_from_arg(args.qwen_model),
+            qwen_base_url=args.qwen_base_url,
+            qwen_api_key_env=args.qwen_api_key_env,
+            qwen_polish=args.qwen_polish,
+            qwen_heartbeat=args.qwen_heartbeat,
+            qwen_max_sentence_silence=args.qwen_max_sentence_silence,
+            qwen_final_timeout=args.qwen_final_timeout,
             progressive=not (args.defer_output or args.output == "STDOUT"),
             progressive_continuous=args.progressive_continuous,
             full_sentence=args.full_sentence,
