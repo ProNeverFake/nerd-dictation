@@ -83,6 +83,8 @@ The Qwen adapter keeps the same behavior while handling these differences:
 - Message partials require `intermediate_result_enabled=true`.
 - Streaming partials are returned by default.
 - Heartbeat events are ignored.
+- Queued partials are coalesced so obsolete results are not typed after a slow update.
+- The last two characters of a partial remain speculative until the next partial confirms them.
 - Events from a sentence older than the last finalized sentence are ignored.
 - A remaining partial result is committed when the task finishes.
 

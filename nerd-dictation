@@ -164,20 +164,25 @@ def simulate_typing_with_xdotool(delete_prev_chars: int, text: str) -> None:
             [
                 cmd,
                 "key",
+                "--delay",
+                "0",
                 "--",
                 *(["BackSpace"] * delete_prev_chars),
             ]
         )
 
-    run_command_or_exit_on_failure(
-        [
-            cmd,
-            "type",
-            "--clearmodifiers",
-            "--",
-            text,
-        ]
-    )
+    if text:
+        run_command_or_exit_on_failure(
+            [
+                cmd,
+                "type",
+                "--clearmodifiers",
+                "--delay",
+                "0",
+                "--",
+                text,
+            ]
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -886,19 +891,51 @@ class ProgressiveTextOutput:
         process_fn: Callable[[str], str],
         progressive: bool,
         progressive_continuous: bool,
+        stable_partial_prefix: bool = False,
     ) -> None:
         self.handle_fn = handle_fn
         self.process_fn = process_fn
         self.progressive = progressive
         self.progressive_continuous = progressive_continuous
+        self.stable_partial_prefix = stable_partial_prefix
         self.text_list: List[str] = []
         self.text_prev = ""
+        self.partial_text_prev: Optional[str] = None
         self.handled_any = False
 
     def reset(self) -> None:
         self.handled_any = False
         self.text_prev = ""
+        self.partial_text_prev = None
         self.text_list.clear()
+
+    def _render_text(self, text_curr: str) -> None:
+        if text_curr == self.text_prev:
+            return
+
+        match = min(len(text_curr), len(self.text_prev))
+        for i in range(min(len(text_curr), len(self.text_prev))):
+            if text_curr[i] != self.text_prev[i]:
+                match = i
+                break
+
+        # Emit text, deleting any previous incorrectly transcribed output.
+        self.handle_fn(len(self.text_prev) - match, text_curr[match:])
+        self.text_prev = text_curr
+
+    def _stable_partial_text(self, text_curr: str) -> str:
+        if self.partial_text_prev is None:
+            # Keep the current tail speculative until the next partial confirms it.
+            stable_len = max(0, len(text_curr) - 2)
+        else:
+            stable_len = 0
+            for i in range(min(len(self.partial_text_prev), len(text_curr))):
+                if self.partial_text_prev[i] != text_curr[i]:
+                    break
+                stable_len = i + 1
+
+        self.partial_text_prev = text_curr
+        return text_curr[:stable_len]
 
     def handle(self, text: str, is_partial: bool) -> None:
         # Simple deferred text input, just accumulate values in a list (finish entering text on exit).
@@ -915,18 +952,15 @@ class ProgressiveTextOutput:
         else:
             text_curr = self.process_fn(" ".join(self.text_list + [text]))
 
-        if text_curr != self.text_prev:
-            match = min(len(text_curr), len(self.text_prev))
-            for i in range(min(len(text_curr), len(self.text_prev))):
-                if text_curr[i] != self.text_prev[i]:
-                    match = i
-                    break
+        if self.stable_partial_prefix and is_partial:
+            text_render = self._stable_partial_text(text_curr)
+        else:
+            text_render = text_curr
 
-            # Emit text, deleting any previous incorrectly transcribed output.
-            self.handle_fn(len(self.text_prev) - match, text_curr[match:])
-            self.text_prev = text_curr
+        self._render_text(text_render)
 
         if not is_partial:
+            self.partial_text_prev = None
             if self.progressive_continuous:
                 self.text_prev = ""
             else:
@@ -1337,6 +1371,41 @@ class QwenTranscriptState:
         return text, True
 
 
+def qwen_drain_event_queue(
+    event_queue: "queue.Queue[Tuple[str, object]]",
+    transcript_state: QwenTranscriptState,
+) -> "Tuple[List[Tuple[int, str, bool]], bool, str]":
+    pending_updates: Dict[int, Tuple[int, str, bool]] = {}
+    finished = False
+    error = ""
+
+    while True:
+        try:
+            event_type, event_data = event_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        if event_type == "result":
+            if not isinstance(event_data, dict):
+                continue
+            sentence = event_data.get("payload", {}).get("output", {}).get("sentence", {})
+            if not isinstance(sentence, dict):
+                continue
+            sentence_id = sentence.get("sentence_id")
+            if not isinstance(sentence_id, int):
+                continue
+            update = transcript_state.consume(sentence)
+            if update is not None:
+                pending_updates[sentence_id] = (sentence_id, update[0], update[1])
+        elif event_type == "finished":
+            finished = True
+        elif event_type == "error":
+            error = str(event_data)
+
+    updates = [pending_updates[sentence_id] for sentence_id in sorted(pending_updates)]
+    return updates, finished, error
+
+
 def qwen_model_id_from_arg(model_arg: str) -> str:
     return QWEN_MODEL_ALIASES.get(model_arg, model_arg)
 
@@ -1632,6 +1701,7 @@ def text_from_qwen_pipe(
         process_fn=process_fn,
         progressive=progressive,
         progressive_continuous=progressive_continuous,
+        stable_partial_prefix=True,
     )
     transcript_state = QwenTranscriptState()
     def create_qwen_client() -> QwenWebSocketClient:
@@ -1779,27 +1849,16 @@ def text_from_qwen_pipe(
             time.sleep(0.05)
             continue
 
-        while True:
-            try:
-                event_type, event_data = qwen_client.event_queue.get_nowait()
-            except queue.Empty:
-                break
-
-            if event_type == "result":
-                message = event_data
-                assert isinstance(message, dict)
-                sentence = message.get("payload", {}).get("output", {}).get("sentence", {})
-                if isinstance(sentence, dict):
-                    update = transcript_state.consume(sentence)
-                    if update is not None:
-                        text_output.handle(update[0], not update[1])
-                        timeout_time_prev = time.time()
-            elif event_type == "finished":
-                qwen_finished = True
-            elif event_type == "error":
-                qwen_error = str(event_data)
-                code = 2
-                break
+        updates, qwen_finished, qwen_error = qwen_drain_event_queue(
+            qwen_client.event_queue,
+            transcript_state,
+        )
+        for _sentence_id, update_text, update_is_final in updates:
+            text_output.handle(update_text, not update_is_final)
+            timeout_time_prev = time.time()
+        if qwen_error:
+            code = 2
+            break
 
         if code != 0:
             break
@@ -1852,24 +1911,12 @@ def text_from_qwen_pipe(
     qwen_client.finish()
     final_deadline = time.time() + qwen_final_timeout
     while time.time() < final_deadline and not qwen_finished and not qwen_error:
-        while True:
-            try:
-                event_type, event_data = qwen_client.event_queue.get_nowait()
-            except queue.Empty:
-                break
-
-            if event_type == "result":
-                message = event_data
-                assert isinstance(message, dict)
-                sentence = message.get("payload", {}).get("output", {}).get("sentence", {})
-                if isinstance(sentence, dict):
-                    update = transcript_state.consume(sentence)
-                    if update is not None:
-                        text_output.handle(update[0], not update[1])
-            elif event_type == "finished":
-                qwen_finished = True
-            elif event_type == "error":
-                qwen_error = str(event_data)
+        updates, qwen_finished, qwen_error = qwen_drain_event_queue(
+            qwen_client.event_queue,
+            transcript_state,
+        )
+        for _sentence_id, update_text, update_is_final in updates:
+            text_output.handle(update_text, not update_is_final)
 
         if not qwen_finished and not qwen_error:
             time.sleep(0.01)

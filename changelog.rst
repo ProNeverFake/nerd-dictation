@@ -5,6 +5,7 @@ Changelog
 
 - 2026/09/25: Add an optional Qwen WebSocket ASR backend with message and streaming model selection.
 - 2026/09/25: Add English documentation for the Qwen backend and an Ubuntu F9 toggle shortcut.
+- 2026/09/25: Coalesce Qwen partial results and remove xdotool delays to reduce correction stalls.
 - 2023/02/09: Add ``--vosk-grammar-file`` allowing a restricted set of words.
 - 2023/02/09: Use ``SIGHUB`` to reload the user configuration at run-time.
 - 2023/02/02: Add ``--suspend-on-start`` argument to the ``begin`` sub-command.

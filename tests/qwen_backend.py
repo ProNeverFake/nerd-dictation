@@ -8,6 +8,7 @@ Test the model-independent progressive text output and Qwen event adapter.
 import importlib.machinery
 import importlib.util
 import os
+import queue
 import sys
 import unittest
 
@@ -75,6 +76,35 @@ class TestProgressiveTextOutput(unittest.TestCase):
 
         self.assertEqual(output, [(0, "HELLO WORLD")])
 
+    def test_stable_partial_prefix_defers_unstable_tail(self) -> None:
+        output = []
+
+        def handle_fn(delete_prev_chars: int, text: str) -> None:
+            output.append((delete_prev_chars, text))
+
+        text_output = nerd_dictation.ProgressiveTextOutput(
+            handle_fn=handle_fn,
+            process_fn=lambda text: text,
+            progressive=True,
+            progressive_continuous=False,
+            stable_partial_prefix=True,
+        )
+
+        text_output.handle("hel", True)
+        text_output.handle("hell", True)
+        text_output.handle("hello", True)
+        text_output.handle("hello world", False)
+
+        self.assertEqual(
+            output,
+            [
+                (0, "h"),
+                (0, "el"),
+                (0, "l"),
+                (0, "o world"),
+            ],
+        )
+
 
 class TestQwenTranscriptState(unittest.TestCase):
     def test_partial_and_final_updates(self) -> None:
@@ -102,6 +132,33 @@ class TestQwenTranscriptState(unittest.TestCase):
         self.assertIsNone(
             state.consume({"heartbeat": True, "sentence_id": 0, "text": ""})
         )
+
+
+class TestQwenEventCoalescing(unittest.TestCase):
+    def test_obsolete_partials_are_not_rendered(self) -> None:
+        events = queue.Queue()
+        state = nerd_dictation.QwenTranscriptState()
+
+        for sentence in (
+            {"sentence_id": 1, "text": "hel", "sentence_end": False},
+            {"sentence_id": 1, "text": "hello", "sentence_end": False},
+            {"sentence_id": 1, "text": "hello.", "sentence_end": True},
+            {"sentence_id": 2, "text": "world", "sentence_end": False},
+        ):
+            events.put(("result", {"payload": {"output": {"sentence": sentence}}}))
+        events.put(("finished", {}))
+
+        updates, finished, error = nerd_dictation.qwen_drain_event_queue(events, state)
+
+        self.assertEqual(
+            updates,
+            [
+                (1, "hello.", True),
+                (2, "world", False),
+            ],
+        )
+        self.assertTrue(finished)
+        self.assertEqual(error, "")
 
 
 class TestQwenRequest(unittest.TestCase):
@@ -146,6 +203,55 @@ class TestQwenRequest(unittest.TestCase):
     def test_audio_chunking(self) -> None:
         chunks = nerd_dictation.qwen_audio_chunks(b"12345678", chunk_size=3)
         self.assertEqual(chunks, [b"123", b"456", b"78"])
+
+    def test_xdotool_typing_has_no_default_delay(self) -> None:
+        calls = []
+        original = nerd_dictation.run_command_or_exit_on_failure
+        nerd_dictation.run_command_or_exit_on_failure = calls.append
+        try:
+            nerd_dictation.simulate_typing_with_xdotool(0, "hello")
+        finally:
+            nerd_dictation.run_command_or_exit_on_failure = original
+
+        self.assertEqual(
+            calls,
+            [
+                [
+                    "xdotool",
+                    "type",
+                    "--clearmodifiers",
+                    "--delay",
+                    "0",
+                    "--",
+                    "hello",
+                ]
+            ],
+        )
+
+    def test_xdotool_backspaces_have_no_default_delay(self) -> None:
+        calls = []
+        original = nerd_dictation.run_command_or_exit_on_failure
+        nerd_dictation.run_command_or_exit_on_failure = calls.append
+        try:
+            nerd_dictation.simulate_typing_with_xdotool(3, "")
+        finally:
+            nerd_dictation.run_command_or_exit_on_failure = original
+
+        self.assertEqual(
+            calls,
+            [
+                [
+                    "xdotool",
+                    "key",
+                    "--delay",
+                    "0",
+                    "--",
+                    "BackSpace",
+                    "BackSpace",
+                    "BackSpace",
+                ]
+            ],
+        )
 
 
 if __name__ == "__main__":
