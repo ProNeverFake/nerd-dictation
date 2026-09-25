@@ -1671,25 +1671,33 @@ def text_from_qwen_pipe(
         if not has_ps:
             return
 
+        os.kill(ps.pid, signal.SIGINT)
+
         if flush_audio:
-            try:
-                empty_reads = 0
-                while empty_reads < 3:
+            flush_deadline = time.monotonic() + 0.25
+            while time.monotonic() < flush_deadline:
+                try:
                     data = stdout.read(block_size)
-                    if not data:
-                        empty_reads += 1
-                        time.sleep(0.01)
-                        continue
-                    empty_reads = 0
+                except (BlockingIOError, NameError, ValueError):
+                    data = None
+
+                if data:
                     for audio_chunk in qwen_audio_chunks(data):
-                        qwen_client.send_audio(audio_chunk)
-            except (BlockingIOError, NameError, ValueError):
-                pass
-            except queue.Full:
-                pass
+                        try:
+                            qwen_client.send_audio(audio_chunk)
+                        except queue.Full:
+                            break
+                elif ps.poll() is not None:
+                    break
+                else:
+                    time.sleep(0.01)
 
         stdout.close()
-        os.kill(ps.pid, signal.SIGINT)
+        try:
+            ps.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            os.kill(ps.pid, signal.SIGKILL)
+            ps.wait()
         del stdout, ps
         has_ps = False
 
