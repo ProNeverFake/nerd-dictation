@@ -6,7 +6,7 @@ Changelog
 - 2026/09/25: Add an optional Qwen WebSocket ASR backend with message and streaming model selection.
 - 2026/09/25: Add English documentation for the Qwen backend and an Ubuntu F9 toggle shortcut.
 - 2026/09/25: Coalesce Qwen partial results and remove xdotool delays to reduce correction stalls.
-- 2026/09/25: Rotate long Qwen sessions before the context limit and make the F9 toggle perform a bounded hard stop.
+- 2026/09/25: Rotate long Qwen sessions before the context limit and let the F9 toggle flush final corrections before exit.
 - 2026/09/25: Use the Qwen streaming model as the default backend.
 - 2026/09/25: Decouple keyboard output from speech input with a worker-backed TextOutput module.
 - 2023/02/09: Add ``--vosk-grammar-file`` allowing a restricted set of words.
