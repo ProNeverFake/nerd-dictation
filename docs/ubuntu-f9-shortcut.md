@@ -86,15 +86,9 @@ If the list is not empty, use the GUI or `dconf-editor` to append the new keybin
 
 ## Model Switching During Testing
 
-GNOME allows multiple custom shortcuts. A practical test setup is:
+Keep the Ubuntu shortcut assigned only to F9. To test another backend, update the F9 command or run the toggle command manually with a different `--qwen-model` value.
 
-```text
-F9  -> Qwen message model
-F10 -> Qwen streaming model
-F11 -> local Vosk
-```
-
-When any backend is already active, pressing a configured toggle shortcut stops that process. Press the shortcut again to start its configured backend. Do not assign the same key to more than one custom shortcut entry.
+The wrapper starts each session in its own process group and performs a bounded hard stop on the second F9 press. This keeps F9 responsive even if recognition or keyboard output is blocked. Do not assign the same key to more than one custom shortcut entry.
 
 ## Wayland and X11
 

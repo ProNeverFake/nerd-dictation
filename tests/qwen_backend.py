@@ -145,10 +145,20 @@ class TestQwenEventCoalescing(unittest.TestCase):
             {"sentence_id": 1, "text": "hello.", "sentence_end": True},
             {"sentence_id": 2, "text": "world", "sentence_end": False},
         ):
-            events.put(("result", {"payload": {"output": {"sentence": sentence}}}))
-        events.put(("finished", {}))
+            events.put(
+                (
+                    "result",
+                    {
+                        "payload": {
+                            "output": {"sentence": sentence},
+                            "usage": {"total_tokens": 42},
+                        }
+                    },
+                )
+            )
+        events.put(("finished", {"payload": {"usage": {"total_tokens": 50}}}))
 
-        updates, finished, error = nerd_dictation.qwen_drain_event_queue(events, state)
+        updates, finished, error, total_tokens = nerd_dictation.qwen_drain_event_queue(events, state)
 
         self.assertEqual(
             updates,
@@ -159,6 +169,24 @@ class TestQwenEventCoalescing(unittest.TestCase):
         )
         self.assertTrue(finished)
         self.assertEqual(error, "")
+        self.assertEqual(total_tokens, 50)
+
+    def test_session_rotation_waits_for_a_final_result(self) -> None:
+        threshold = nerd_dictation.QWEN_CONTEXT_ROTATE_TOKENS
+        self.assertFalse(
+            nerd_dictation.qwen_should_rotate_session(
+                threshold,
+                [(1, "partial", False)],
+                False,
+            )
+        )
+        self.assertTrue(
+            nerd_dictation.qwen_should_rotate_session(
+                threshold,
+                [(1, "final", True)],
+                False,
+            )
+        )
 
 
 class TestQwenRequest(unittest.TestCase):

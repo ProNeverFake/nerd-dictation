@@ -52,6 +52,7 @@ QWEN_MODEL_ALIASES = {
 
 QWEN_DEFAULT_MODEL = QWEN_MODEL_ALIASES["message"]
 QWEN_DEFAULT_BASE_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+QWEN_CONTEXT_ROTATE_TOKENS = 6000
 
 
 # -----------------------------------------------------------------------------
@@ -1374,10 +1375,11 @@ class QwenTranscriptState:
 def qwen_drain_event_queue(
     event_queue: "queue.Queue[Tuple[str, object]]",
     transcript_state: QwenTranscriptState,
-) -> "Tuple[List[Tuple[int, str, bool]], bool, str]":
+) -> "Tuple[List[Tuple[int, str, bool]], bool, str, int]":
     pending_updates: Dict[int, Tuple[int, str, bool]] = {}
     finished = False
     error = ""
+    total_tokens = 0
 
     while True:
         try:
@@ -1388,6 +1390,11 @@ def qwen_drain_event_queue(
         if event_type == "result":
             if not isinstance(event_data, dict):
                 continue
+            usage = event_data.get("payload", {}).get("usage")
+            if isinstance(usage, dict):
+                event_total_tokens = usage.get("total_tokens")
+                if isinstance(event_total_tokens, int):
+                    total_tokens = max(total_tokens, event_total_tokens)
             sentence = event_data.get("payload", {}).get("output", {}).get("sentence", {})
             if not isinstance(sentence, dict):
                 continue
@@ -1399,11 +1406,29 @@ def qwen_drain_event_queue(
                 pending_updates[sentence_id] = (sentence_id, update[0], update[1])
         elif event_type == "finished":
             finished = True
+            if isinstance(event_data, dict):
+                usage = event_data.get("payload", {}).get("usage")
+                if isinstance(usage, dict):
+                    event_total_tokens = usage.get("total_tokens")
+                    if isinstance(event_total_tokens, int):
+                        total_tokens = max(total_tokens, event_total_tokens)
         elif event_type == "error":
             error = str(event_data)
 
     updates = [pending_updates[sentence_id] for sentence_id in sorted(pending_updates)]
-    return updates, finished, error
+    return updates, finished, error, total_tokens
+
+
+def qwen_should_rotate_session(
+    total_tokens: int,
+    updates: "List[Tuple[int, str, bool]]",
+    finished: bool,
+) -> bool:
+    if finished or total_tokens < QWEN_CONTEXT_ROTATE_TOKENS:
+        return False
+    if not updates:
+        return False
+    return updates[-1][2]
 
 
 def qwen_model_id_from_arg(model_arg: str) -> str:
@@ -1493,13 +1518,18 @@ class QwenWebSocketClient:
     def send_audio(self, data: bytes) -> None:
         self.audio_queue.put_nowait(data)
 
-    def finish(self) -> None:
+    def finish(self, timeout: float = 1.0) -> bool:
+        deadline = time.monotonic() + timeout
         while not self.cancel_event.is_set() and self.thread.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
             try:
-                self.audio_queue.put(None, timeout=0.1)
-                return
+                self.audio_queue.put(None, timeout=min(0.1, remaining))
+                return True
             except queue.Full:
                 continue
+        return False
 
     def cancel(self) -> None:
         self.cancel_event.set()
@@ -1717,6 +1747,8 @@ def text_from_qwen_pipe(
         )
 
     qwen_client = create_qwen_client()
+    qwen_finished = False
+    qwen_total_tokens = 0
 
     if verbose >= 1:
         sys.stderr.write("Connecting to Qwen ASR model {!r}...\n".format(qwen_model))
@@ -1793,6 +1825,7 @@ def text_from_qwen_pipe(
         nonlocal stdout
         nonlocal qwen_client
         nonlocal transcript_state
+        nonlocal qwen_total_tokens
 
         if verbose >= 1:
             sys.stderr.write("Recording.\n")
@@ -1802,8 +1835,27 @@ def text_from_qwen_pipe(
         ps, stdout = recording_proc_start()
         has_ps = True
         transcript_state = QwenTranscriptState()
+        qwen_total_tokens = 0
         qwen_client = create_qwen_client()
         qwen_client.start()
+
+    def rotate_qwen_client() -> None:
+        nonlocal qwen_client
+        nonlocal transcript_state
+        nonlocal qwen_total_tokens
+        nonlocal qwen_finished
+
+        previous_client = qwen_client
+        qwen_client = create_qwen_client()
+        qwen_client.start()
+        transcript_state = QwenTranscriptState()
+        qwen_total_tokens = 0
+        qwen_finished = False
+        previous_client.cancel()
+        previous_client.join()
+
+        if verbose >= 1:
+            sys.stderr.write("Rotated Qwen ASR session after reaching the context threshold.\n")
 
     from types import FrameType
 
@@ -1840,7 +1892,6 @@ def text_from_qwen_pipe(
     timeout_time_prev = time.time()
     code = 0
     qwen_error = ""
-    qwen_finished = False
     block_size = 3200
 
     while code == 0:
@@ -1849,16 +1900,19 @@ def text_from_qwen_pipe(
             time.sleep(0.05)
             continue
 
-        updates, qwen_finished, qwen_error = qwen_drain_event_queue(
+        updates, qwen_finished, qwen_error, event_total_tokens = qwen_drain_event_queue(
             qwen_client.event_queue,
             transcript_state,
         )
+        qwen_total_tokens = max(qwen_total_tokens, event_total_tokens)
         for _sentence_id, update_text, update_is_final in updates:
             text_output.handle(update_text, not update_is_final)
             timeout_time_prev = time.time()
         if qwen_error:
             code = 2
             break
+        if qwen_should_rotate_session(qwen_total_tokens, updates, qwen_finished):
+            rotate_qwen_client()
 
         if code != 0:
             break
@@ -1908,10 +1962,12 @@ def text_from_qwen_pipe(
         return text_output.handled_any
 
     close_recording(flush_audio=True)
-    qwen_client.finish()
+    if not qwen_client.finish():
+        qwen_error = "Timed out waiting for the Qwen audio queue to drain."
+        qwen_client.cancel()
     final_deadline = time.time() + qwen_final_timeout
     while time.time() < final_deadline and not qwen_finished and not qwen_error:
-        updates, qwen_finished, qwen_error = qwen_drain_event_queue(
+        updates, qwen_finished, qwen_error, _event_total_tokens = qwen_drain_event_queue(
             qwen_client.event_queue,
             transcript_state,
         )

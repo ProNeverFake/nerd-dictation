@@ -87,6 +87,7 @@ The Qwen adapter keeps the same behavior while handling these differences:
 - The last two characters of a partial remain speculative until the next partial confirms them.
 - Events from a sentence older than the last finalized sentence are ignored.
 - A remaining partial result is committed when the task finishes.
+- Long sessions rotate to a new WebSocket task after 6000 tokens at a finalized sentence boundary. The 8192-token context limit is therefore not reached during normal dictation.
 
 ## Fallback and Privacy
 
